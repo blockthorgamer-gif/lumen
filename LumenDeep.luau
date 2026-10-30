@@ -1,27 +1,3 @@
---!nocheck
---[[
-	LUMEN DEEP  -  a complete 2D survival game for Roblox, written as ONE client-side Luau script.
-
-	You are a small spark of light at the bottom of the sea. Swarms of deep-sea creatures hunt you.
-	Your light fires on its own - you steer, dash, collect motes, level up, and outlast three bosses.
-
-	HOW TO RUN
-	  Paste this whole file into a client-side (Local) script - a LocalScript, or your client executor -
-	  and execute it. It builds every object itself. No assets, no Studio setup, no server needed.
-	  Running it a second time cleanly replaces the first copy.
-
-	CONTROLS
-	  Keyboard : WASD / arrow keys move   |  Space or Shift dash  |  P pause  |  1 2 3 pick upgrade  |  R reroll
-	  Touch    : drag anywhere on the left half to steer  |  Dash button (bottom right)  |  II button pauses
-	  Gamepad  : left stick moves  |  A dash  |  Start pause  |  X / Y / B pick upgrade 1 / 2 / 3
-
-	NOTES
-	  * Everything is drawn with GUI frames (circles, rounded rectangles, rotated bars).
-	  * Pearls / best score / settings are kept in attributes on your Player object, so they last for the
-	    current Roblox session only. Nothing is written to disk or sent anywhere.
-	  * Sound uses a few built-in client sound files if your client has them; the game never depends on audio.
-]]
-
 local GUI_NAME = "LumenDeep2D"
 local REGISTRY_KEY = "__LumenDeepRegistry"
 
