@@ -1,0 +1,3351 @@
+--!nocheck
+--[[
+	LUMEN DEEP  -  a complete 2D survival game for Roblox, written as ONE client-side Luau script.
+
+	You are a small spark of light at the bottom of the sea. Swarms of deep-sea creatures hunt you.
+	Your light fires on its own - you steer, dash, collect motes, level up, and outlast three bosses.
+
+	HOW TO RUN
+	  Paste this whole file into a client-side (Local) script - a LocalScript, or your client executor -
+	  and execute it. It builds every object itself. No assets, no Studio setup, no server needed.
+	  Running it a second time cleanly replaces the first copy.
+
+	CONTROLS
+	  Keyboard : WASD / arrow keys move   |  Space or Shift dash  |  P pause  |  1 2 3 pick upgrade  |  R reroll
+	  Touch    : drag anywhere on the left half to steer  |  Dash button (bottom right)  |  II button pauses
+	  Gamepad  : left stick moves  |  A dash  |  Start pause  |  X / Y / B pick upgrade 1 / 2 / 3
+
+	NOTES
+	  * Everything is drawn with GUI frames (circles, rounded rectangles, rotated bars).
+	  * Pearls / best score / settings are kept in attributes on your Player object, so they last for the
+	    current Roblox session only. Nothing is written to disk or sent anywhere.
+	  * Sound uses a few built-in client sound files if your client has them; the game never depends on audio.
+]]
+
+local GUI_NAME = "LumenDeep2D"
+local REGISTRY_KEY = "__LumenDeepRegistry"
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local GuiService = game:GetService("GuiService")
+local StarterGui = game:GetService("StarterGui")
+local ContextActionService = game:GetService("ContextActionService")
+
+local player = Players.LocalPlayer
+if not player then
+	warn("[Lumen Deep] No LocalPlayer found. Run this as a client-side (Local) script.")
+	return
+end
+local playerGui = player:FindFirstChildOfClass("PlayerGui") or player:WaitForChild("PlayerGui", 10)
+if not playerGui then
+	warn("[Lumen Deep] PlayerGui is not available.")
+	return
+end
+
+-- Replace any previous copy of the game (cleanly, so no connections are leaked).
+do
+	local prev = rawget(_G, REGISTRY_KEY)
+	if type(prev) == "table" and type(prev.destroy) == "function" then
+		pcall(prev.destroy)
+	end
+	for _, child in ipairs(playerGui:GetChildren()) do
+		if child.Name == GUI_NAME or child.Name == GUI_NAME .. "_UI" then
+			pcall(function() child:Destroy() end)
+		end
+	end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Small utilities
+----------------------------------------------------------------------------------------------------
+local floor, ceil, sqrt, sin, cos, abs, min, max, exp, pi =
+	math.floor, math.ceil, math.sqrt, math.sin, math.cos, math.abs, math.min, math.max, math.exp, math.pi
+local atan2 = math.atan2 or math.atan
+local TAU = pi * 2
+local rng = Random.new()
+
+local function clamp(v, lo, hi)
+	if v < lo then return lo elseif v > hi then return hi end
+	return v
+end
+local function lerp(a, b, t) return a + (b - a) * t end
+local function rnd(a, b) return a + (b - a) * rng:NextNumber() end
+local function rndi(a, b) return rng:NextInteger(a, b) end
+local function chance(p) return rng:NextNumber() < p end
+local function wipe(t) for i = #t, 1, -1 do t[i] = nil end end
+local function fmtTime(sec)
+	sec = max(0, floor(sec))
+	return string.format("%02d:%02d", floor(sec / 60), sec % 60)
+end
+local function comma(n)
+	local s = tostring(floor(n))
+	local out, count = "", 0
+	for i = #s, 1, -1 do
+		out = s:sub(i, i) .. out
+		count = count + 1
+		if count % 3 == 0 and i > 1 then out = "," .. out end
+	end
+	return out
+end
+
+-- Cleanup bag: connections, instances, functions and threads are released in reverse order.
+local Janitor = { items = {} }
+function Janitor:add(item)
+	self.items[#self.items + 1] = item
+	return item
+end
+function Janitor:clean()
+	local items = self.items
+	self.items = {}
+	for i = #items, 1, -1 do
+		local it = items[i]
+		local t = typeof(it)
+		if t == "RBXScriptConnection" then
+			pcall(function() it:Disconnect() end)
+		elseif t == "Instance" then
+			pcall(function() it:Destroy() end)
+		elseif t == "function" then
+			pcall(it)
+		elseif t == "thread" then
+			pcall(task.cancel, it)
+		end
+	end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Look & feel
+----------------------------------------------------------------------------------------------------
+local C3 = Color3.fromRGB
+local COL = {
+	deep = C3(5, 22, 31), floorTop = C3(13, 66, 78), floorBot = C3(5, 25, 36),
+	wall = C3(2, 11, 17), wallEdge = C3(43, 211, 196), pebble = C3(40, 120, 128),
+	gold = C3(255, 233, 168), white = C3(255, 255, 255), ink = C3(4, 16, 22),
+	coral = C3(255, 107, 139), orange = C3(255, 159, 90), violet = C3(155, 123, 255),
+	lime = C3(184, 255, 106), cyan = C3(107, 232, 255), red = C3(255, 82, 96),
+	teal = C3(43, 211, 196), panel = C3(8, 33, 45), panel2 = C3(14, 54, 70),
+	text = C3(226, 247, 250), dim = C3(139, 181, 190),
+}
+local FONT_TITLE = Enum.Font.FredokaOne
+local FONT_BODY = Enum.Font.GothamMedium
+local FONT_BOLD = Enum.Font.GothamBold
+
+----------------------------------------------------------------------------------------------------
+-- Static game data
+----------------------------------------------------------------------------------------------------
+local ARENA_W, ARENA_H = 2400, 1600   -- world size in world units
+local INV_W, INV_H = 1 / ARENA_W, 1 / ARENA_H
+local WALL = 56                       -- rock wall thickness
+local STEP = 1 / 60                   -- fixed simulation step
+local VIEW_W, VIEW_H = 840, 472       -- minimum visible world area (units)
+local UI_W, UI_H = 800, 450           -- interface design space (units)
+
+local DIFFS = {
+	{ name = "Calm",   hp = 0.80, dmg = 0.70, spawn = 0.85, xp = 1.15, pearl = 0.8 },
+	{ name = "Normal", hp = 1.00, dmg = 1.00, spawn = 1.00, xp = 1.00, pearl = 1.0 },
+	{ name = "Brutal", hp = 1.35, dmg = 1.30, spawn = 1.20, xp = 1.00, pearl = 1.5 },
+}
+
+-- Permanent upgrades bought with pearls (kept for the Roblox session).
+local PERKS = {
+	{ id = "shell", name = "Thick shell",  desc = "+10% max health per level",              max = 5, base = 40 },
+	{ id = "light", name = "Sharp light",  desc = "+5% damage per level",                    max = 5, base = 50 },
+	{ id = "fins",  name = "Strong fins",  desc = "+4% move speed per level",                max = 5, base = 40 },
+	{ id = "sense", name = "Deep sense",   desc = "+10% pickup range, +6% motes per level",  max = 5, base = 35 },
+	{ id = "eye",   name = "Keen eye",     desc = "+3% critical hit chance per level",       max = 5, base = 45 },
+	{ id = "wind",  name = "Second wind",  desc = "Revive once per dive at half health",     max = 1, base = 250 },
+}
+
+-- Weapon stats by level (1..5)
+local BOLT = {
+	{ dmg = 10, cd = 0.52, n = 1, pierce = 0 },
+	{ dmg = 10, cd = 0.50, n = 2, pierce = 0 },
+	{ dmg = 12, cd = 0.48, n = 2, pierce = 0 },
+	{ dmg = 12, cd = 0.45, n = 3, pierce = 1 },
+	{ dmg = 16, cd = 0.36, n = 3, pierce = 2 },
+}
+local ORBIT = {
+	{ n = 2, dmg = 7,  rad = 62, spd = 3.4 },
+	{ n = 3, dmg = 7,  rad = 62, spd = 3.4 },
+	{ n = 3, dmg = 9,  rad = 76, spd = 3.4 },
+	{ n = 4, dmg = 9,  rad = 76, spd = 4.2 },
+	{ n = 5, dmg = 13, rad = 84, spd = 4.2 },
+}
+local NOVA = {
+	{ dmg = 16, rad = 115, cd = 3.6, kb = 260 },
+	{ dmg = 20, rad = 132, cd = 3.6, kb = 260 },
+	{ dmg = 20, rad = 132, cd = 2.9, kb = 260 },
+	{ dmg = 24, rad = 158, cd = 2.9, kb = 380 },
+	{ dmg = 34, rad = 170, cd = 2.0, kb = 380 },
+}
+local ARC = {
+	{ dmg = 14, cd = 1.50, n = 3, reach = 300 },
+	{ dmg = 17, cd = 1.50, n = 4, reach = 300 },
+	{ dmg = 17, cd = 1.15, n = 4, reach = 300 },
+	{ dmg = 20, cd = 1.15, n = 5, reach = 360 },
+	{ dmg = 28, cd = 1.00, n = 7, reach = 360 },
+}
+
+local WEAPON_IDS = { "bolt", "orbit", "nova", "arc" }
+local PASSIVE_IDS = { "power", "tide", "fins", "shell", "lure", "bloom" }
+
+local INFO = {
+	bolt  = { name = "Light dart", kind = "weapon", col = COL.gold, desc = {
+		"Fires a dart at the nearest enemy.", "Fires 2 darts per volley.", "+30% damage and faster fire.",
+		"3 darts per volley that pierce 1 enemy.", "+30% damage, pierces 2, rapid fire." } },
+	orbit = { name = "Spore ring", kind = "weapon", col = COL.lime, desc = {
+		"2 spores orbit you and hurt what they touch.", "+1 spore.", "Wider orbit and +30% damage.",
+		"+1 spore and a faster spin.", "+1 spore and +45% damage." } },
+	nova  = { name = "Sonar pulse", kind = "weapon", col = COL.cyan, desc = {
+		"A shockwave blasts nearby enemies away.", "+15% radius and +25% damage.", "Recharges faster.",
+		"+20% radius and stronger knockback.", "+40% damage and rapid recharge." } },
+	arc   = { name = "Eel arc", kind = "weapon", col = C3(170, 190, 255), desc = {
+		"Lightning jumps between 3 enemies.", "Jumps to 4 enemies, +20% damage.", "Recharges faster.",
+		"Jumps to 5 enemies with longer reach.", "Jumps to 7 enemies, +40% damage." } },
+	power = { name = "Bright core", kind = "passive", col = COL.gold,   desc = "+15% damage" },
+	tide  = { name = "Quick tide",  kind = "passive", col = COL.cyan,   desc = "Weapons recharge 8% faster" },
+	fins  = { name = "Swift fins",  kind = "passive", col = COL.lime,   desc = "+8% move speed" },
+	shell = { name = "Hard shell",  kind = "passive", col = COL.coral,  desc = "+25 max health and heal 25" },
+	lure  = { name = "Glow lure",   kind = "passive", col = COL.orange, desc = "+30% pickup range" },
+	bloom = { name = "Kelp bloom",  kind = "passive", col = COL.lime,   desc = "Regenerate 0.6 health per second" },
+	heal  = { name = "Repair",      kind = "extra",   col = COL.coral,  desc = "Restore 40% of your max health." },
+	pearl = { name = "Pearl cache", kind = "extra",   col = COL.white,  desc = "Gain 40 pearls when this dive ends." },
+	vac   = { name = "Tide pull",   kind = "extra",   col = COL.cyan,   desc = "Pull every mote on the map to you." },
+}
+
+-- Bosses surface on a schedule. Defeating the last one wins the dive.
+local BOSS_SCHEDULE = {
+	{ t = 150, id = "angler" },
+	{ t = 300, id = "brood" },
+	{ t = 450, id = "watcher" },
+}
+
+----------------------------------------------------------------------------------------------------
+-- Session save (Player attributes: lasts until you leave this Roblox session)
+----------------------------------------------------------------------------------------------------
+local Save = { pearls = 0, best = 0, perks = {}, diff = 2, sound = true, shake = true }
+for i = 1, #PERKS do Save.perks[PERKS[i].id] = 0 end
+
+local function saveLoad()
+	pcall(function()
+		local v = player:GetAttribute("LD_Pearls")
+		if type(v) == "number" then Save.pearls = max(0, floor(v)) end
+		v = player:GetAttribute("LD_Best")
+		if type(v) == "number" then Save.best = max(0, floor(v)) end
+		v = player:GetAttribute("LD_Diff")
+		if type(v) == "number" and v >= 1 and v <= #DIFFS then Save.diff = floor(v) end
+		v = player:GetAttribute("LD_Sound")
+		if type(v) == "boolean" then Save.sound = v end
+		v = player:GetAttribute("LD_Shake")
+		if type(v) == "boolean" then Save.shake = v end
+		v = player:GetAttribute("LD_Perks")
+		if type(v) == "string" then
+			local i = 0
+			for n in string.gmatch(v, "%d+") do
+				i = i + 1
+				local p = PERKS[i]
+				if p then Save.perks[p.id] = clamp(tonumber(n) or 0, 0, p.max) end
+			end
+		end
+	end)
+end
+local function saveStore()
+	pcall(function()
+		player:SetAttribute("LD_Pearls", floor(Save.pearls))
+		player:SetAttribute("LD_Best", floor(Save.best))
+		player:SetAttribute("LD_Diff", Save.diff)
+		player:SetAttribute("LD_Sound", Save.sound)
+		player:SetAttribute("LD_Shake", Save.shake)
+		local parts = {}
+		for i = 1, #PERKS do parts[i] = tostring(Save.perks[PERKS[i].id]) end
+		player:SetAttribute("LD_Perks", table.concat(parts, ","))
+	end)
+end
+saveLoad()
+
+----------------------------------------------------------------------------------------------------
+-- GUI construction helpers
+----------------------------------------------------------------------------------------------------
+local V2, U2 = Vector2.new, UDim2.new
+
+local function mk(class, props, parent)
+	local inst = Instance.new(class)
+	for k, v in pairs(props) do inst[k] = v end
+	if parent then inst.Parent = parent end
+	return inst
+end
+local function corner(inst, r) return mk("UICorner", { CornerRadius = UDim.new(0, r) }, inst) end
+local function pill(inst) return mk("UICorner", { CornerRadius = UDim.new(0.5, 0) }, inst) end
+local function outline(inst, col, th, tr)
+	-- Border mode matters: on text objects (buttons) the default "Contextual" mode would outline the text instead.
+	return mk("UIStroke", {
+		Color = col, Thickness = th or 2, Transparency = tr or 0, ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	}, inst)
+end
+-- NOTE: a UIGradient multiplies the frame colour, so frames that use one must have a white BackgroundColor3.
+local function gradient(inst, c0, c1, rot)
+	return mk("UIGradient", { Color = ColorSequence.new(c0, c1), Rotation = rot or 90 }, inst)
+end
+local function label(parent, text, size, col, font, props)
+	local p = {
+		BackgroundTransparency = 1, BorderSizePixel = 0, Text = text, TextSize = size,
+		TextColor3 = col or COL.text, Font = font or FONT_BODY,
+	}
+	if props then for k, v in pairs(props) do p[k] = v end end
+	return mk("TextLabel", p, parent)
+end
+
+----------------------------------------------------------------------------------------------------
+-- Screen scaffold: [Root] -> View (scaled game world) / vignette / UI (scaled interface)
+----------------------------------------------------------------------------------------------------
+local gui = mk("ScreenGui", {
+	Name = GUI_NAME, ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 1000,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, playerGui)
+pcall(function() gui.ScreenInsets = Enum.ScreenInsets.None end)   -- world fills the whole display, notch included
+Janitor:add(gui)
+-- Interface layer: its own ScreenGui so HUD and menus stay inside the device's safe area (notches, rounded corners).
+local gui2 = mk("ScreenGui", {
+	Name = GUI_NAME .. "_UI", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 1001,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, playerGui)
+pcall(function() gui2.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets end)
+Janitor:add(gui2)
+local root2 = mk("Frame", { Name = "UIRoot", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0 }, gui2)
+
+local root = mk("Frame", {
+	Name = "Root", Size = UDim2.fromScale(1, 1), BackgroundColor3 = COL.deep, BorderSizePixel = 0,
+	Active = true, ClipsDescendants = true,
+}, gui)
+
+local Cam = { x = ARENA_W / 2, y = ARENA_H / 2, vw = VIEW_W, vh = VIEW_H, pw = VIEW_W, ph = VIEW_H, scale = 1 }
+local U = { root2 = root2, gui2 = gui2, uw = UI_W, uh = UI_H, scale = 1, inset = 0, screens = {}, W = 1280, H = 720, hurtT = 0, bannerT = 0, hintT = 0 }
+local FAR_W, FAR_H = 1700, 1500
+
+-- The view is sized in world units and scaled with a UIScale so every screen shows a similar area.
+local view = mk("Frame", {
+	Name = "View", AnchorPoint = V2(0.5, 0.5), Position = U2(0.5, 0, 0.5, 0),
+	Size = UDim2.fromOffset(VIEW_W, VIEW_H), BackgroundColor3 = COL.floorBot, BorderSizePixel = 0,
+	ClipsDescendants = true, ZIndex = 1, Visible = false,
+}, root)
+Cam.zoom = mk("UIScale", { Scale = 1 }, view)
+local back = mk("Frame", {
+	Name = "Back", Size = UDim2.fromOffset(ARENA_W, ARENA_H), BackgroundColor3 = Color3.new(1, 1, 1),
+	BorderSizePixel = 0, ZIndex = 1,
+}, view)
+gradient(back, COL.floorTop, COL.floorBot, 90)
+local far = mk("Frame", {
+	Name = "Far", Size = UDim2.fromOffset(FAR_W, FAR_H), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 2,
+}, view)
+local world = mk("Frame", {
+	Name = "World", Size = UDim2.fromOffset(ARENA_W, ARENA_H), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 3,
+}, view)
+
+local L = {}
+for i, name in ipairs({ "gems", "enemies", "low", "player", "shots", "fx", "text" }) do
+	L[name] = mk("Frame", {
+		Name = "L_" .. name, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = i,
+	}, world)
+end
+
+-- Soft edge shading over the view
+local vignette = {}
+do
+	local function edge(name, anchor, pos, size, rot)
+		local f = mk("Frame", {
+			Name = name, AnchorPoint = anchor, Position = pos, Size = size, BackgroundColor3 = Color3.new(0, 0, 0),
+			BorderSizePixel = 0, ZIndex = 2, Visible = false,
+		}, root)
+		mk("UIGradient", { Transparency = NumberSequence.new(0.35, 1), Rotation = rot }, f)
+		vignette[#vignette + 1] = f
+	end
+	edge("EdgeT", V2(0, 0), U2(0, 0, 0, 0), U2(1, 0, 0.22, 0), 90)
+	edge("EdgeB", V2(0, 1), U2(0, 0, 1, 0), U2(1, 0, 0.22, 0), 270)
+	edge("EdgeL", V2(0, 0), U2(0, 0, 0, 0), U2(0.14, 0, 1, 0), 0)
+	edge("EdgeR", V2(1, 0), U2(1, 0, 0, 0), U2(0.14, 0, 1, 0), 180)
+end
+
+local ui = mk("Frame", {
+	Name = "UI", AnchorPoint = V2(0.5, 0.5), Position = U2(0.5, 0, 0.5, 0), Size = UDim2.fromOffset(UI_W, UI_H),
+	BackgroundTransparency = 1, BorderSizePixel = 0,
+}, root2)
+U.zoom = mk("UIScale", { Scale = 1 }, ui)
+
+-- Recompute zoom + interface scale from the current screen size (called on start and every resize).
+local function relayout()
+	local sz = root.AbsoluteSize
+	if sz.X < 64 or sz.Y < 64 then
+		local cam = workspace.CurrentCamera
+		sz = cam and cam.ViewportSize or V2(1280, 720)
+		if sz.X < 64 or sz.Y < 64 then sz = V2(1280, 720) end
+	end
+	local W, H = sz.X, sz.Y
+	U.W, U.H = W, H
+	local sz2 = root2.AbsoluteSize
+	local W2, H2 = W, H
+	if sz2.X >= 64 and sz2.Y >= 64 then W2, H2 = sz2.X, sz2.Y end
+	local s = clamp(min(W / VIEW_W, H / VIEW_H), 0.55, 4)
+	Cam.scale = s
+	Cam.vw, Cam.vh = W / s, H / s
+	Cam.pw, Cam.ph = ceil(Cam.vw), ceil(Cam.vh)
+	view.Size = UDim2.fromOffset(Cam.pw, Cam.ph)
+	Cam.zoom.Scale = s
+	local us = clamp(min(W2 / UI_W, H2 / UI_H), 0.5, 4)
+	U.scale = us
+	U.uw, U.uh = W2 / us, H2 / us
+	ui.Size = UDim2.fromOffset(ceil(U.uw), ceil(U.uh))
+	U.zoom.Scale = us
+	local inset = 0
+	pcall(function() inset = GuiService:GetGuiInset().Y end)
+	U.inset = inset / us
+	if U.applyInset then U.applyInset() end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Sound (optional: built-in client sound files; silently skipped if unavailable)
+----------------------------------------------------------------------------------------------------
+local sfx
+do
+	local SFX_IDS = {
+		click = "rbxasset://sounds/clickfast.wav",
+		ping = "rbxasset://sounds/electronicpingshort.wav",
+		dash = "rbxasset://sounds/swoosh.wav",
+		hurt = "rbxasset://sounds/action_jump_land.mp3",
+		pickup = "rbxasset://sounds/snap.mp3",
+		lose = "rbxasset://sounds/uuhhh.mp3",
+		win = "rbxasset://sounds/victory.wav",
+	}
+	local objs, last = {}, {}
+	sfx = function(name, vol)
+		if not Save.sound then return end
+		local id = SFX_IDS[name]
+		if not id then return end
+		local now = os.clock()
+		if last[name] and now - last[name] < 0.07 then return end
+		last[name] = now
+		pcall(function()
+			local s = objs[name]
+			if not s then
+				s = mk("Sound", { Name = "sfx_" .. name, SoundId = id, Volume = vol or 0.35 }, gui)
+				objs[name] = s
+			end
+			s.TimePosition = 0
+			s:Play()
+		end)
+	end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Shape helpers: everything in the game is built from circles and (rotated) rounded bars
+----------------------------------------------------------------------------------------------------
+local function circle(parent, d, col, tr, x, y)
+	local f = Instance.new("Frame")
+	f.AnchorPoint = V2(0.5, 0.5)
+	f.Position = U2(0.5, x or 0, 0.5, y or 0)
+	f.Size = UDim2.fromOffset(d, d)
+	f.BackgroundColor3 = col
+	f.BackgroundTransparency = tr or 0
+	f.BorderSizePixel = 0
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0.5, 0)
+	c.Parent = f
+	f.Parent = parent
+	return f
+end
+local function bar(parent, w, h, col, tr, x, y, rot, rad)
+	local f = Instance.new("Frame")
+	f.AnchorPoint = V2(0.5, 0.5)
+	f.Position = U2(0.5, x or 0, 0.5, y or 0)
+	f.Size = UDim2.fromOffset(w, h)
+	f.BackgroundColor3 = col
+	f.BackgroundTransparency = tr or 0
+	f.BorderSizePixel = 0
+	f.Rotation = rot or 0
+	if rad and rad > 0 then
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(0, rad)
+		c.Parent = f
+	end
+	f.Parent = parent
+	return f
+end
+local function ringShape(parent, d, col, th, x, y)
+	local f = Instance.new("Frame")
+	f.AnchorPoint = V2(0.5, 0.5)
+	f.Position = U2(0.5, x or 0, 0.5, y or 0)
+	f.Size = UDim2.fromOffset(d, d)
+	f.BackgroundTransparency = 1
+	f.BorderSizePixel = 0
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0.5, 0)
+	c.Parent = f
+	local s = Instance.new("UIStroke")
+	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	s.Color = col
+	s.Thickness = th
+	s.Parent = f
+	f.Parent = parent
+	return f
+end
+local function holder(parent, size, name)
+	local f = Instance.new("Frame")
+	f.Name = name or "H"
+	f.AnchorPoint = V2(0.5, 0.5)
+	f.Size = UDim2.fromOffset(size, size)
+	f.BackgroundTransparency = 1
+	f.BorderSizePixel = 0
+	f.Visible = false
+	f.Parent = parent
+	return f
+end
+
+-- Object pools: every moving thing is recycled, so play never creates GUI objects after start-up.
+local Pool = {}
+function Pool.new(build) return { free = {}, build = build } end
+function Pool.get(p)
+	local n = #p.free
+	if n > 0 then
+		local o = p.free[n]
+		p.free[n] = nil
+		return o
+	end
+	return p.build()
+end
+function Pool.put(p, o)
+	o.root.Visible = false
+	p.free[#p.free + 1] = o
+end
+function Pool.warm(p, n)
+	for _ = 1, n do p.free[#p.free + 1] = p.build() end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Creatures. build(holder) draws the creature and returns (bodyFrame, extraRefs).
+----------------------------------------------------------------------------------------------------
+local ET = {}
+ET.drifter = { r = 10, hp = 12, spd = 72, dmg = 5, xp = 1, mass = 1, ai = "chase", score = 10, col = COL.coral,
+	build = function(h)
+		local b = circle(h, 20, COL.coral)
+		circle(h, 9, COL.white, 0, 0, -2)
+		circle(h, 4, COL.ink, 0, 0, -1)
+		return b
+	end }
+ET.swarmer = { r = 7, hp = 6, spd = 104, dmg = 3, xp = 1, mass = 0.6, ai = "chase", score = 5, col = COL.orange,
+	build = function(h)
+		local b = circle(h, 14, COL.orange)
+		circle(h, 6, COL.white, 0, 0, -1)
+		circle(h, 3, COL.ink, 0, 0, 0)
+		return b
+	end }
+ET.bruiser = { r = 18, hp = 70, spd = 50, dmg = 14, xp = 5, mass = 3, ai = "chase", score = 40, col = C3(232, 92, 76),
+	build = function(h)
+		bar(h, 30, 30, C3(150, 52, 58), 0, 0, 0, 0, 5)
+		bar(h, 30, 30, C3(150, 52, 58), 0, 0, 0, 45, 5)
+		local b = circle(h, 32, C3(232, 92, 76))
+		circle(h, 11, COL.white, 0, 0, -3)
+		circle(h, 5, COL.ink, 0, 0, -2)
+		return b
+	end }
+ET.dasher = { r = 11, hp = 22, spd = 56, dmg = 10, xp = 3, mass = 1, ai = "dasher", score = 25, col = C3(221, 255, 92),
+	build = function(h)
+		local b = bar(h, 20, 20, C3(221, 255, 92), 0, 0, 0, 45, 3)
+		circle(h, 7, COL.white)
+		return b
+	end }
+ET.spitter = { r = 12, hp = 26, spd = 52, dmg = 6, xp = 4, mass = 1, ai = "spitter", score = 35, col = COL.violet,
+	build = function(h)
+		for i = -1, 1 do bar(h, 3, 11, C3(120, 95, 220), 0.1, i * 6, 13, 0, 1) end
+		local b = circle(h, 24, COL.violet)
+		circle(h, 13, C3(205, 190, 255), 0.35, 0, -2)
+		circle(h, 6, COL.white, 0, 0, 1)
+		return b
+	end }
+ET.splitter = { r = 15, hp = 36, spd = 58, dmg = 8, xp = 3, mass = 1.5, ai = "chase", score = 30, col = C3(150, 70, 200),
+	build = function(h)
+		local b = circle(h, 30, C3(150, 70, 200))
+		circle(h, 10, C3(236, 168, 255), 0, -6, -3)
+		circle(h, 10, C3(236, 168, 255), 0, 6, -3)
+		circle(h, 10, C3(236, 168, 255), 0, 0, 6)
+		return b
+	end }
+
+local BT = {}
+BT.angler = { name = "Anglerfish", r = 40, hp = 560, spd = 56, dmg = 18, xp = 100, mass = 9, ai = "boss", score = 600,
+	cd = 2.3, pats = { "ring", "aimed", "ring2" }, col = C3(96, 28, 70),
+	build = function(h)
+		circle(h, 112, COL.red, 0.88)
+		local b = circle(h, 80, C3(96, 28, 70))
+		circle(h, 58, C3(138, 48, 98), 0.2, -5, -5)
+		bar(h, 4, 44, C3(190, 100, 130), 0, 20, -52, 28, 2)
+		circle(h, 46, COL.gold, 0.82, 32, -72)
+		circle(h, 20, COL.gold, 0, 32, -72)
+		circle(h, 22, COL.white, 0, -14, -8)
+		circle(h, 10, COL.ink, 0, -13, -6)
+		bar(h, 54, 12, COL.ink, 0, 0, 24, 0, 6)
+		for i = -2, 2 do bar(h, 5, 9, COL.white, 0, i * 10, 20, 0, 2) end
+		return b
+	end }
+BT.brood = { name = "Brood Mother", r = 36, hp = 1150, spd = 62, dmg = 16, xp = 110, mass = 9, ai = "boss", score = 900,
+	cd = 2.1, pats = { "summon", "charge", "aimed", "summon" }, col = C3(170, 100, 255),
+	build = function(h)
+		circle(h, 104, COL.violet, 0.88)
+		for i = -2, 2 do bar(h, 5, 34, C3(150, 90, 230), 0.25, i * 11, 40, 0, 2) end
+		local b = circle(h, 72, C3(170, 100, 255))
+		circle(h, 52, C3(210, 160, 255), 0.45, 0, -6)
+		circle(h, 12, COL.white, 0, -14, -8)
+		circle(h, 5, COL.ink, 0, -14, -7)
+		circle(h, 12, COL.white, 0, 14, -8)
+		circle(h, 5, COL.ink, 0, 14, -7)
+		local eggs = { { -16, 10 }, { -5, 17 }, { 7, 13 }, { 17, 7 } }
+		for i = 1, #eggs do circle(h, 9, C3(255, 226, 255), 0.15, eggs[i][1], eggs[i][2]) end
+		return b
+	end }
+BT.watcher = { name = "The Watcher", r = 50, hp = 3600, spd = 46, dmg = 22, xp = 200, mass = 12, ai = "boss", score = 2500,
+	cd = 1.8, pats = { "ring", "aimed", "summon", "ring2", "charge", "aimed" }, final = true, col = C3(250, 240, 230),
+	build = function(h)
+		circle(h, 150, COL.red, 0.9)
+		local b = circle(h, 100, C3(250, 240, 230))
+		for i = 1, 6 do
+			local a = i * 1.05
+			bar(h, 2, 26, C3(230, 110, 120), 0.4, cos(a) * 36, sin(a) * 36, math.deg(a) + 90, 1)
+		end
+		local iris = circle(h, 60, C3(60, 200, 190))
+		circle(iris, 46, C3(28, 138, 150))
+		local pupil = circle(iris, 26, COL.ink)
+		circle(iris, 8, COL.white, 0.1, -8, -9)
+		return b, { iris = iris, pupil = pupil }
+	end }
+
+----------------------------------------------------------------------------------------------------
+-- Pools for everything that moves
+----------------------------------------------------------------------------------------------------
+local Pools = { enemy = {}, gem = {}, pick = {} }
+
+do
+	local function enemyBuilder(id, def)
+		return function()
+			local h = holder(L.enemies, def.r * 2, "E_" .. id)
+			local body, extra = def.build(h)
+			return { root = h, body = body, extra = extra }
+		end
+	end
+	for id, def in pairs(ET) do Pools.enemy[id] = Pool.new(enemyBuilder(id, def)) end
+	for id, def in pairs(BT) do Pools.enemy[id] = Pool.new(enemyBuilder(id, def)) end
+end
+
+Pools.bolt = Pool.new(function()
+	local h = holder(L.shots, 18, "Bolt")
+	circle(h, 18, COL.gold, 0.72)
+	circle(h, 8, COL.white)
+	return { root = h }
+end)
+Pools.ebolt = Pool.new(function()
+	local h = holder(L.shots, 18, "EBolt")
+	circle(h, 18, COL.red, 0.65)
+	circle(h, 9, C3(255, 200, 180))
+	return { root = h }
+end)
+Pools.blade = Pool.new(function()
+	local h = holder(L.shots, 26, "Blade")
+	circle(h, 28, COL.lime, 0.75)
+	circle(h, 15, COL.lime)
+	circle(h, 6, COL.white)
+	return { root = h }
+end)
+
+do
+	local GEM_DEF = {
+		{ d = 14, core = 7, col = COL.lime },
+		{ d = 19, core = 10, col = COL.cyan },
+		{ d = 26, core = 14, col = C3(255, 150, 220) },
+	}
+	for i = 1, #GEM_DEF do
+		local g = GEM_DEF[i]
+		Pools.gem[i] = Pool.new(function()
+			local h = holder(L.gems, g.d, "Gem" .. i)
+			circle(h, g.d, g.col, 0.7)
+			circle(h, g.core, g.col, 0.05)
+			return { root = h }
+		end)
+	end
+end
+
+Pools.pick.heal = Pool.new(function()
+	local h = holder(L.gems, 30, "PickHeal")
+	circle(h, 32, COL.coral, 0.6)
+	circle(h, 22, COL.coral)
+	bar(h, 4, 14, COL.white, 0, 0, 0, 0, 1)
+	bar(h, 14, 4, COL.white, 0, 0, 0, 0, 1)
+	return { root = h }
+end)
+Pools.pick.vac = Pool.new(function()
+	local h = holder(L.gems, 30, "PickVac")
+	circle(h, 32, COL.cyan, 0.6)
+	circle(h, 22, COL.cyan)
+	ringShape(h, 14, COL.white, 2)
+	circle(h, 4, COL.white)
+	return { root = h }
+end)
+
+Pools.part = Pool.new(function()
+	local f = circle(L.fx, 6, COL.white)
+	f.Name = "Part"
+	f.Visible = false
+	return { root = f }
+end)
+Pools.text = Pool.new(function()
+	local t = label(L.text, "", 16, COL.white, FONT_BOLD, {
+		Name = "Float", AnchorPoint = V2(0.5, 0.5), Size = UDim2.fromOffset(90, 24), Visible = false,
+		TextStrokeTransparency = 0.45, TextStrokeColor3 = COL.ink,
+	})
+	return { root = t }
+end)
+Pools.ring = Pool.new(function()
+	local f = mk("Frame", {
+		Name = "Ring", AnchorPoint = V2(0.5, 0.5), Size = UDim2.fromOffset(10, 10), BackgroundTransparency = 1,
+		BorderSizePixel = 0, Visible = false,
+	}, L.low)
+	pill(f)
+	local s = outline(f, COL.cyan, 4, 0.2)
+	return { root = f, stroke = s }
+end)
+Pools.zap = Pool.new(function()
+	local f = bar(L.fx, 40, 3, COL.white, 0, 0, 0, 0, 2)
+	f.Name = "Zap"
+	f.Visible = false
+	return { root = f }
+end)
+
+-- Player sprite (not pooled): a glowing mote with two little eyes.
+local Vis = {}
+do
+	local h = holder(L.player, 40, "Player")
+	h.Visible = true
+	Vis.root = h
+	Vis.aura = circle(h, 104, COL.gold, 0.94)
+	circle(h, 72, COL.gold, 0.92)
+	Vis.halo = circle(h, 44, COL.cyan, 0.84)
+	Vis.body = circle(h, 28, COL.gold)
+	Vis.core = circle(h, 14, COL.white, 0.1, 0, 1)
+	Vis.eyeL = circle(h, 4, COL.ink, 0, -4, -2)
+	Vis.eyeR = circle(h, 4, COL.ink, 0, 4, -2)
+end
+
+----------------------------------------------------------------------------------------------------
+-- Icons (drawn from primitives, 40x40 design box scaled to any size)
+----------------------------------------------------------------------------------------------------
+local function icon(parent, id, size, props)
+	local s = size / 40
+	local p = { Name = "Icon_" .. id, BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.fromOffset(size, size) }
+	if props then for k, v in pairs(props) do p[k] = v end end
+	local h = mk("Frame", p, parent)
+	local function r(v) return floor(v * s + 0.5) end
+	local function c(d, col, tr, x, y) return circle(h, max(2, r(d)), col, tr, r(x or 0), r(y or 0)) end
+	local function b(w, hh, col, tr, x, y, rot, rad)
+		return bar(h, max(2, r(w)), max(2, r(hh)), col, tr, r(x or 0), r(y or 0), rot, rad and max(1, r(rad)) or 0)
+	end
+	local function ring(d, col, th, x, y) return ringShape(h, max(4, r(d)), col, max(1, r(th)), r(x or 0), r(y or 0)) end
+	local bl = C3(190, 205, 255)
+	if id == "bolt" then
+		c(14, COL.gold, 0, 7, 0); c(10, COL.gold, 0.45, -5, 0); c(6, COL.gold, 0.7, -12, 0)
+	elseif id == "orbit" then
+		c(8, COL.white, 0.5); c(10, COL.lime, 0, 0, -12); c(10, COL.lime, 0, 10, 6); c(10, COL.lime, 0, -10, 6)
+	elseif id == "nova" then
+		ring(34, COL.cyan, 3); ring(18, COL.cyan, 3); c(6, COL.white)
+	elseif id == "arc" then
+		b(13, 5, bl, 0, -0.5, -9.5, 60, 2); b(13, 5, bl, 0, -0.5, 0, 120, 2); b(13, 5, bl, 0, -0.5, 9.5, 60, 2)
+	elseif id == "power" then
+		c(14, COL.gold); b(4, 9, COL.gold, 0, 0, -13, 0, 1); b(4, 9, COL.gold, 0, 0, 13, 0, 1)
+		b(9, 4, COL.gold, 0, -13, 0, 0, 1); b(9, 4, COL.gold, 0, 13, 0, 0, 1)
+	elseif id == "tide" then
+		b(26, 4, COL.cyan, 0, 0, -9, 0, 2); b(20, 4, COL.cyan, 0, -3, 0, 0, 2); b(14, 4, COL.cyan, 0, -6, 9, 0, 2)
+	elseif id == "fins" then
+		b(15, 4, COL.lime, 0, -6, -6, 40, 2); b(15, 4, COL.lime, 0, -6, 6, -40, 2)
+		b(15, 4, COL.lime, 0.35, 6, -6, 40, 2); b(15, 4, COL.lime, 0.35, 6, 6, -40, 2)
+	elseif id == "shell" then
+		c(14, COL.coral, 0, -6, -4); c(14, COL.coral, 0, 6, -4); b(14, 14, COL.coral, 0, 0, 3, 45, 2)
+	elseif id == "lure" then
+		c(32, COL.gold, 0.82, 7, -9); c(11, COL.gold, 0, 7, -9); b(3, 22, C3(190, 120, 140), 0, 0, 5, 18, 1)
+	elseif id == "bloom" or id == "heal" then
+		local col = id == "heal" and COL.coral or COL.lime
+		b(8, 24, col, 0, 0, 0, 0, 3); b(24, 8, col, 0, 0, 0, 0, 3)
+	elseif id == "pearl" then
+		c(26, C3(214, 232, 255)); c(8, COL.white, 0.1, -5, -5)
+	elseif id == "vac" then
+		ring(34, COL.cyan, 3); ring(20, COL.cyan, 3); c(6, COL.cyan)
+	end
+	return h
+end
+
+----------------------------------------------------------------------------------------------------
+-- Static scenery: seabed, rock walls, drifting marine snow and light shafts
+----------------------------------------------------------------------------------------------------
+do
+	-- soft pools of light on the seabed
+	for _ = 1, 9 do
+		local d = rndi(300, 520)
+		local px, py = rndi(100, ARENA_W - 100), rndi(100, ARENA_H - 100)
+		for step = 0, 2 do
+			local dd = floor(d * (1 - step * 0.28))
+			pill(mk("Frame", {
+				AnchorPoint = V2(0.5, 0.5), Position = UDim2.fromOffset(px, py), Size = UDim2.fromOffset(dd, dd),
+				BackgroundColor3 = COL.cyan, BackgroundTransparency = 0.972, BorderSizePixel = 0,
+			}, back))
+		end
+	end
+	-- pebbles
+	for _ = 1, 170 do
+		local d = rndi(5, 15)
+		local f = mk("Frame", {
+			AnchorPoint = V2(0.5, 0.5),
+			Position = UDim2.fromOffset(rndi(WALL + 10, ARENA_W - WALL - 10), rndi(WALL + 10, ARENA_H - WALL - 10)),
+			Size = UDim2.fromOffset(d, d), BackgroundColor3 = COL.pebble, BackgroundTransparency = rnd(0.5, 0.85),
+			BorderSizePixel = 0,
+		}, back)
+		pill(f)
+	end
+	-- sand ripples
+	for _ = 1, 46 do
+		mk("Frame", {
+			AnchorPoint = V2(0.5, 0.5),
+			Position = UDim2.fromOffset(rndi(WALL + 60, ARENA_W - WALL - 60), rndi(WALL + 30, ARENA_H - WALL - 30)),
+			Size = UDim2.fromOffset(rndi(60, 200), 3), Rotation = rnd(-8, 8), BackgroundColor3 = COL.cyan,
+			BackgroundTransparency = 0.92, BorderSizePixel = 0,
+		}, back)
+	end
+	-- coral clumps
+	local coralCols = { C3(20, 96, 96), C3(18, 78, 92), C3(34, 116, 104), C3(60, 70, 110) }
+	for _ = 1, 16 do
+		local cx, cy = rnd(WALL + 90, ARENA_W - WALL - 90), rnd(WALL + 90, ARENA_H - WALL - 90)
+		local col = coralCols[rndi(1, #coralCols)]
+		for _ = 1, 4 do
+			local d = rndi(16, 36)
+			pill(mk("Frame", {
+				AnchorPoint = V2(0.5, 0.5), Position = UDim2.fromOffset(cx + rndi(-20, 20), cy + rndi(-14, 14)),
+				Size = UDim2.fromOffset(d, d), BackgroundColor3 = col, BackgroundTransparency = 0.3, BorderSizePixel = 0,
+			}, back))
+		end
+	end
+	-- rock walls with a glowing inner edge
+	local function rock(x, y, w, h, z, col, tr, rad)
+		local f = mk("Frame", {
+			Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(w, h), BackgroundColor3 = col or COL.wall,
+			BackgroundTransparency = tr or 0, BorderSizePixel = 0, ZIndex = z or 5,
+		}, back)
+		if rad then corner(f, rad) end
+		return f
+	end
+	rock(0, 0, ARENA_W, WALL, 5); rock(0, ARENA_H - WALL, ARENA_W, WALL, 5)
+	rock(0, 0, WALL, ARENA_H, 5); rock(ARENA_W - WALL, 0, WALL, ARENA_H, 5)
+	rock(WALL - 3, WALL - 3, ARENA_W - 2 * WALL + 6, 3, 6, COL.wallEdge, 0.45)
+	rock(WALL - 3, ARENA_H - WALL, ARENA_W - 2 * WALL + 6, 3, 6, COL.wallEdge, 0.45)
+	rock(WALL - 3, WALL - 3, 3, ARENA_H - 2 * WALL + 6, 6, COL.wallEdge, 0.45)
+	rock(ARENA_W - WALL, WALL - 3, 3, ARENA_H - 2 * WALL + 6, 6, COL.wallEdge, 0.45)
+	for _ = 1, 10 do
+		local w, h = rndi(50, 130), rndi(14, 34)
+		rock(rndi(WALL, ARENA_W - WALL - w), WALL - h + rndi(4, 10), w, h, 5, COL.wall, 0, 9)
+		rock(rndi(WALL, ARENA_W - WALL - w), ARENA_H - WALL - rndi(4, 10), w, h, 5, COL.wall, 0, 9)
+	end
+	for _ = 1, 7 do
+		local w, h = rndi(14, 34), rndi(50, 130)
+		rock(WALL - w + rndi(4, 10), rndi(WALL, ARENA_H - WALL - h), w, h, 5, COL.wall, 0, 9)
+		rock(ARENA_W - WALL - rndi(4, 10), rndi(WALL, ARENA_H - WALL - h), w, h, 5, COL.wall, 0, 9)
+	end
+
+	-- parallax layer: light shafts, soft blobs and marine snow
+	for i = 1, 4 do
+		local f = mk("Frame", {
+			AnchorPoint = V2(0.5, 0), Position = UDim2.fromOffset(150 + i * 380, -80), Size = UDim2.fromOffset(110 + (i % 2) * 70, 1400),
+			Rotation = 14, BackgroundColor3 = C3(190, 255, 245), BorderSizePixel = 0,
+		}, far)
+		mk("UIGradient", { Transparency = NumberSequence.new(0.93, 1), Rotation = 90 }, f)
+	end
+	for _ = 1, 5 do
+		local d = rndi(260, 420)
+		local px, py = rndi(0, FAR_W), rndi(0, FAR_H)
+		for step = 0, 2 do
+			local dd = floor(d * (1 - step * 0.3))
+			pill(mk("Frame", {
+				AnchorPoint = V2(0.5, 0.5), Position = UDim2.fromOffset(px, py), Size = UDim2.fromOffset(dd, dd),
+				BackgroundColor3 = COL.teal, BackgroundTransparency = 0.975, BorderSizePixel = 0,
+			}, far))
+		end
+	end
+	for _ = 1, 150 do
+		local d = rndi(2, 5)
+		local f = mk("Frame", {
+			AnchorPoint = V2(0.5, 0.5), Position = UDim2.fromOffset(rndi(0, FAR_W), rndi(0, FAR_H)),
+			Size = UDim2.fromOffset(d, d), BackgroundColor3 = COL.text, BackgroundTransparency = rnd(0.45, 0.85),
+			BorderSizePixel = 0,
+		}, far)
+		pill(f)
+	end
+end
+
+-- Pre-build most pooled objects once so nothing has to be created mid-fight.
+do
+	local warm = { drifter = 48, swarmer = 44, bruiser = 8, dasher = 10, spitter = 10, splitter = 8 }
+	for id, n in pairs(warm) do Pool.warm(Pools.enemy[id], n) end
+	Pool.warm(Pools.bolt, 36); Pool.warm(Pools.ebolt, 40); Pool.warm(Pools.blade, 5)
+	Pool.warm(Pools.gem[1], 70); Pool.warm(Pools.gem[2], 14); Pool.warm(Pools.gem[3], 6)
+	Pool.warm(Pools.part, 120); Pool.warm(Pools.text, 18); Pool.warm(Pools.ring, 8); Pool.warm(Pools.zap, 20)
+end
+
+----------------------------------------------------------------------------------------------------
+-- Game state
+----------------------------------------------------------------------------------------------------
+local P = {
+	x = ARENA_W / 2, y = ARENA_H / 2, vx = 0, vy = 0, r = 12, hp = 100, maxHp = 100, iframes = 0,
+	weapons = {}, passives = {}, dashT = 0, dashCd = 0, dashDX = 1, dashDY = 0, fx = 1, fy = 0, orbitA = 0,
+	dmgMul = 1, cdMul = 1, speed = 178, pickup = 70, regen = 0, xpMul = 1, crit = 0.05,
+}
+local R = {
+	state = "menu", time = 0, kills = 0, score = 0, level = 1, xp = 0, xpNeed = 5, pending = 0, rerolls = 2,
+	spawnAcc = 0, shake = 0, won = false, endless = false, timers = {}, bossIdx = 1, evIdx = 1, vacT = 0, dashBuf = 0,
+	bossKills = 0, revived = false, dyingT = 0, pearlsGiven = 0, bonusPearls = 0, purging = false,
+	maxAlive = 80, partCap = 140, nextRing = 0, maxR = 12, acc = 0,
+}
+local Ent = {
+	enemies = {}, pshots = {}, eshots = {}, gems = {}, picks = {}, parts = {}, texts = {}, rings = {}, zaps = {}, blades = {},
+}
+local Game = {}   -- flow control (start, pause, finish...) - filled in below
+
+local function xpNeedFor(level)
+	local k = level - 1
+	return floor(4 + k * 4.5 + k * k * 0.32)
+end
+
+local function compact(list)
+	local n = 0
+	for i = 1, #list do
+		local v = list[i]
+		if v.alive then
+			n = n + 1
+			list[n] = v
+		end
+	end
+	for i = #list, n + 1, -1 do list[i] = nil end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Spatial hash for enemies (used for separation and all weapon queries)
+----------------------------------------------------------------------------------------------------
+local CELL = 96
+local grid, gridUsed, gridN = {}, {}, 0
+local qbuf = {}
+
+local function gridReset()
+	for i = 1, gridN do
+		local a = grid[gridUsed[i]]
+		for j = #a, 1, -1 do a[j] = nil end
+	end
+	gridN = 0
+end
+local function gridAdd(e)
+	local key = (floor(e.x / CELL) + 1) * 128 + (floor(e.y / CELL) + 1)
+	local a = grid[key]
+	if not a then
+		a = {}
+		grid[key] = a
+	end
+	if #a == 0 then
+		gridN = gridN + 1
+		gridUsed[gridN] = key
+	end
+	a[#a + 1] = e
+end
+-- Fills qbuf with candidate enemies near (x, y); returns how many. Callers must re-check alive + distance.
+local function query(x, y, rad)
+	local n = 0
+	local x0, x1 = floor((x - rad) / CELL) + 1, floor((x + rad) / CELL) + 1
+	local y0, y1 = floor((y - rad) / CELL) + 1, floor((y + rad) / CELL) + 1
+	for cx = x0, x1 do
+		for cy = y0, y1 do
+			local a = grid[cx * 128 + cy]
+			if a then
+				for i = 1, #a do
+					n = n + 1
+					qbuf[n] = a[i]
+				end
+			end
+		end
+	end
+	return n
+end
+
+local function nearestEnemy(x, y, range, exclude)
+	local best, bd = nil, range * range
+	local list = Ent.enemies
+	for i = 1, #list do
+		local e = list[i]
+		if e.alive and not (exclude and exclude[e]) then
+			local dx, dy = e.x - x, e.y - y
+			local d2 = dx * dx + dy * dy
+			if d2 < bd then best, bd = e, d2 end
+		end
+	end
+	return best
+end
+
+----------------------------------------------------------------------------------------------------
+-- Visual effects: particles, floating text, rings, lightning
+----------------------------------------------------------------------------------------------------
+local function emit(x, y, vx, vy, size, col, life, tr0)
+	local parts = Ent.parts
+	if #parts >= R.partCap then return end
+	local o = Pool.get(Pools.part)
+	local f = o.root
+	local sz = max(2, floor(size + 0.5))
+	f.Size = UDim2.fromOffset(sz, sz)
+	f.BackgroundColor3 = col
+	f.BackgroundTransparency = tr0 or 0.1
+	f.Position = U2(x * INV_W, 0, y * INV_H, 0)
+	f.Visible = true
+	parts[#parts + 1] = { o = o, x = x, y = y, vx = vx, vy = vy, life = life, max = life, tr0 = tr0 or 0.1 }
+end
+local function burst(x, y, n, col, speed, life, size)
+	for _ = 1, n do
+		local a = rnd(0, TAU)
+		local s = speed * rnd(0.3, 1)
+		emit(x, y, cos(a) * s, sin(a) * s, size * rnd(0.7, 1.3), col, life * rnd(0.7, 1.2))
+	end
+end
+local function floatText(x, y, text, col, size)
+	local texts = Ent.texts
+	if #texts >= 16 then return end
+	local o = Pool.get(Pools.text)
+	local t = o.root
+	t.Text = text
+	t.TextColor3 = col
+	t.TextSize = size or 16
+	t.TextTransparency = 0
+	t.TextStrokeTransparency = 0.45
+	t.Position = U2(x * INV_W, 0, y * INV_H, 0)
+	t.Visible = true
+	texts[#texts + 1] = { o = o, x = x, y = y, vy = -52, life = 0.85, max = 0.85 }
+end
+local function ringFx(x, y, r0, r1, life, col, th, tr0)
+	local rings = Ent.rings
+	if #rings >= 8 then return end
+	local o = Pool.get(Pools.ring)
+	o.stroke.Color = col
+	o.stroke.Thickness = th or 4
+	o.root.Position = U2(x * INV_W, 0, y * INV_H, 0)
+	o.root.Visible = true
+	rings[#rings + 1] = { o = o, x = x, y = y, r0 = r0, r1 = r1, life = life, max = life, tr0 = tr0 or 0.15 }
+end
+local zapZig
+do
+local function zapSeg(x1, y1, x2, y2, col, th)
+	local zaps = Ent.zaps
+	if #zaps >= 30 then return end
+	local o = Pool.get(Pools.zap)
+	local f = o.root
+	local dx, dy = x2 - x1, y2 - y1
+	local len = sqrt(dx * dx + dy * dy)
+	f.Size = UDim2.fromOffset(max(2, floor(len)), th or 3)
+	f.Position = U2((x1 + x2) * 0.5 * INV_W, 0, (y1 + y2) * 0.5 * INV_H, 0)
+	f.Rotation = math.deg(atan2(dy, dx))
+	f.BackgroundColor3 = col or COL.white
+	f.BackgroundTransparency = 0
+	f.Visible = true
+	zaps[#zaps + 1] = { o = o, life = 0.17, max = 0.17 }
+end
+zapZig = function(x1, y1, x2, y2)
+	local dx, dy = x2 - x1, y2 - y1
+	local len = sqrt(dx * dx + dy * dy) + 0.001
+	local off = rnd(-1, 1) * min(18, len * 0.22)
+	local mx, my = (x1 + x2) * 0.5 - dy / len * off, (y1 + y2) * 0.5 + dx / len * off
+	zapSeg(x1, y1, mx, my, C3(214, 226, 255), 4)
+	zapSeg(mx, my, x2, y2, C3(214, 226, 255), 4)
+end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Player stats from passives + permanent upgrades
+----------------------------------------------------------------------------------------------------
+local function recompute()
+	local pas, pk = P.passives, Save.perks
+	P.dmgMul = (1 + 0.15 * pas.power) * (1 + 0.05 * pk.light)
+	P.cdMul = max(0.4, 1 - 0.08 * pas.tide)
+	P.speed = 178 * (1 + 0.08 * pas.fins) * (1 + 0.04 * pk.fins)
+	local newMax = (100 + 25 * pas.shell) * (1 + 0.10 * pk.shell)
+	if P.maxHp and newMax > P.maxHp then P.hp = P.hp + (newMax - P.maxHp) end
+	P.maxHp = newMax
+	P.pickup = 70 * (1 + 0.30 * pas.lure) * (1 + 0.10 * pk.sense)
+	P.regen = 0.6 * pas.bloom
+	P.xpMul = (1 + 0.06 * pk.sense) * DIFFS[Save.diff].xp
+	P.crit = 0.05 + 0.03 * pk.eye
+end
+
+----------------------------------------------------------------------------------------------------
+-- Motes (XP) and pickups
+----------------------------------------------------------------------------------------------------
+local collectGem
+do
+local function addXp(v)
+	R.xp = R.xp + v * P.xpMul
+	while R.xp >= R.xpNeed do
+		R.xp = R.xp - R.xpNeed
+		R.level = R.level + 1
+		R.xpNeed = xpNeedFor(R.level)
+		R.pending = R.pending + 1
+	end
+end
+collectGem = function(g)
+	if not g.alive then return end
+	g.alive = false
+	Pool.put(Pools.gem[g.tier], g.o)
+	addXp(g.v)
+	sfx("pickup", 0.2)
+end
+end
+
+local dropGems
+do
+local function spawnGem(x, y, tier, v)
+	local gems = Ent.gems
+	if #gems >= 110 then
+		for i = 1, #gems do
+			if gems[i].alive then
+				collectGem(gems[i])
+				break
+			end
+		end
+	end
+	local o = Pool.get(Pools.gem[tier])
+	o.root.Position = U2(x * INV_W, 0, y * INV_H, 0)
+	o.root.Visible = true
+	local a = rnd(0, TAU)
+	local s = rnd(30, 90)
+	gems[#gems + 1] = { o = o, alive = true, x = x, y = y, vx = cos(a) * s, vy = sin(a) * s, tier = tier, v = v, mag = 0, sp = 0 }
+end
+dropGems = function(x, y, xp)
+	local left, n = xp, 0
+	while left > 0 and n < 5 do
+		local tier, v = 1, 1
+		if left >= 20 then tier, v = 3, 20 elseif left >= 5 then tier, v = 2, 5 end
+		spawnGem(x + rnd(-8, 8), y + rnd(-8, 8), tier, v)
+		left = left - v
+		n = n + 1
+	end
+end
+end
+
+local function spawnPickup(kind, x, y)
+	local o = Pool.get(Pools.pick[kind])
+	o.root.Position = U2(x * INV_W, 0, y * INV_H, 0)
+	o.root.Visible = true
+	local picks = Ent.picks
+	picks[#picks + 1] = { o = o, alive = true, kind = kind, x = x, y = y, life = 24 }
+end
+
+----------------------------------------------------------------------------------------------------
+-- Creatures: spawning, damage, death
+----------------------------------------------------------------------------------------------------
+local function spawnEnemy(id, x, y)
+	local isBoss = BT[id] ~= nil
+	local def = isBoss and BT[id] or ET[id]
+	local o = Pool.get(Pools.enemy[id])
+	local df = DIFFS[Save.diff]
+	local t = R.time
+	local hpMul = isBoss and df.hp or (1 + t / 260) * df.hp
+	x = clamp(x, WALL + def.r, ARENA_W - WALL - def.r)
+	y = clamp(y, WALL + def.r, ARENA_H - WALL - def.r)
+	local e = {
+		id = id, def = def, o = o, alive = true, isBoss = isBoss, x = x, y = y, vx = 0, vy = 0, kx = 0, ky = 0,
+		r = def.r, mass = def.mass, maxHp = def.hp * hpMul,
+		spd = def.spd * (isBoss and 1 or (1 + min(t, 600) * 0.00045)),
+		dmg = def.dmg * df.dmg * (1 + min(t, 600) / 500),
+		st = isBoss and "move" or "chase", stT = 0, cd = isBoss and 2.5 or rnd(0.8, 2.2), flash = 0, orbCd = 0,
+		sd = chance(0.5) and 1 or -1, pi = 1, dx = 0, dy = 0, curCol = def.col, pupX = 0, pupY = 0, enraged = false,
+	}
+	e.hp = e.maxHp
+	o.root.Position = U2(x * INV_W, 0, y * INV_H, 0)
+	o.root.Visible = true
+	o.body.BackgroundColor3 = def.col
+	local list = Ent.enemies
+	list[#list + 1] = e
+	return e
+end
+
+local function killEnemy(e)
+	if not e.alive then return end
+	e.alive = false
+	Pool.put(Pools.enemy[e.id], e.o)
+	local def = e.def
+	local big = e.isBoss
+	R.kills = R.kills + 1
+	R.score = R.score + def.score
+	if not R.purging or big then
+		burst(e.x, e.y, big and 26 or 7, def.col, big and 320 or 150, big and 0.9 or 0.5, big and 7 or 4)
+	end
+	if big or e.r >= 15 then ringFx(e.x, e.y, e.r * 0.6, e.r * (big and 3.4 or 2), 0.4, def.col, 3) end
+	dropGems(e.x, e.y, def.xp)
+	if not big and not R.purging then
+		if chance(0.011) then spawnPickup("heal", e.x, e.y) elseif chance(0.006) then spawnPickup("vac", e.x, e.y) end
+	end
+	if e.id == "splitter" and not R.purging then
+		for _ = 1, 3 do spawnEnemy("swarmer", e.x + rnd(-16, 16), e.y + rnd(-16, 16)) end
+	end
+	if big then
+		R.shake = max(R.shake, 12)
+		Game.bossDown(e)
+	elseif e.r >= 15 then
+		R.shake = max(R.shake, 3)
+	end
+end
+
+-- Applies damage (with crit roll). kx/ky is a knockback impulse in units/second.
+local function damageEnemy(e, dmg, kx, ky)
+	if not e.alive then return end
+	local crit = false
+	if rng:NextNumber() < P.crit then
+		dmg = dmg * 2
+		crit = true
+	end
+	e.hp = e.hp - dmg
+	e.flash = 0.07
+	local kf = e.isBoss and 0.04 or (1 / e.mass)
+	e.kx = e.kx + kx * kf
+	e.ky = e.ky + ky * kf
+	if crit or e.isBoss then
+		floatText(e.x, e.y - e.r - 6, tostring(floor(dmg + 0.5)), crit and COL.gold or COL.white, crit and 20 or 15)
+	end
+	if e.hp <= 0 then
+		killEnemy(e)
+	else
+		emit(e.x, e.y, rnd(-70, 70), rnd(-70, 70), 3, COL.white, 0.25)
+	end
+end
+
+local function playerDown()
+	if Save.perks.wind > 0 and not R.revived then
+		R.revived = true
+		P.hp = P.maxHp * 0.5
+		P.iframes = 2.5
+		ringFx(P.x, P.y, 20, 380, 0.6, COL.gold, 6)
+		local n = query(P.x, P.y, 380)
+		for i = 1, n do
+			local e = qbuf[i]
+			if e.alive then
+				local dx, dy = e.x - P.x, e.y - P.y
+				local d = sqrt(dx * dx + dy * dy) + 0.001
+				if d < 380 then damageEnemy(e, 60, dx / d * 520, dy / d * 520) end
+			end
+		end
+		burst(P.x, P.y, 24, COL.gold, 320, 0.8, 6)
+		R.shake = 10
+		if U.banner then U.banner("Second wind!", COL.gold) end
+		sfx("ping")
+		return
+	end
+	R.state = "dying"
+	R.dyingT = 0
+	burst(P.x, P.y, 30, COL.gold, 280, 1.1, 6)
+	ringFx(P.x, P.y, 14, 220, 0.8, COL.gold, 5)
+	R.shake = 14
+	sfx("lose")
+end
+
+local function hurtPlayer(dmg)
+	if R.state ~= "playing" or P.iframes > 0 or P.dashT > 0 then return end
+	P.hp = P.hp - dmg
+	P.iframes = 0.9
+	R.shake = min(R.shake + 6, 14)
+	U.hurtT = 0.5
+	floatText(P.x, P.y - 24, "-" .. floor(dmg + 0.5), COL.red, 18)
+	burst(P.x, P.y, 9, COL.coral, 170, 0.5, 5)
+	sfx("hurt", 0.3)
+	if P.hp <= 0 then
+		P.hp = 0
+		playerDown()
+	end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Shots
+----------------------------------------------------------------------------------------------------
+local function fireBolt(x, y, ang, dmg, pierce)
+	local shots = Ent.pshots
+	if #shots >= 80 then return end
+	local o = Pool.get(Pools.bolt)
+	o.root.Position = U2(x * INV_W, 0, y * INV_H, 0)
+	o.root.Visible = true
+	shots[#shots + 1] = {
+		o = o, alive = true, x = x, y = y, vx = cos(ang) * 540, vy = sin(ang) * 540, r = 5, dmg = dmg,
+		pierce = pierce, hit = pierce > 0 and {} or nil, life = 1.2,
+	}
+end
+local function fireEShot(x, y, dx, dy, spd, dmg)
+	local shots = Ent.eshots
+	if #shots >= 90 then return end
+	local o = Pool.get(Pools.ebolt)
+	o.root.Position = U2(x * INV_W, 0, y * INV_H, 0)
+	o.root.Visible = true
+	shots[#shots + 1] = { o = o, alive = true, x = x, y = y, vx = dx * spd, vy = dy * spd, r = 6, dmg = dmg, life = 5 }
+end
+
+----------------------------------------------------------------------------------------------------
+-- Timers and the spawn director
+----------------------------------------------------------------------------------------------------
+local function addTimer(t, fn) R.timers[#R.timers + 1] = { t = t, fn = fn } end
+local function runTimers(dt)
+	local ts = R.timers
+	for i = #ts, 1, -1 do
+		local tm = ts[i]
+		if tm then
+			tm.t = tm.t - dt
+			if tm.t <= 0 then
+				table.remove(ts, i)
+				tm.fn()
+			end
+		end
+	end
+end
+
+local directorTick
+do
+-- A point just outside the visible area, inside the arena.
+local function spawnPoint()
+	local rx, ry = Cam.vw * 0.5 + 60, Cam.vh * 0.5 + 60
+	for _ = 1, 10 do
+		local a = rnd(0, TAU)
+		local x, y = P.x + cos(a) * rx, P.y + sin(a) * ry
+		if x > WALL + 24 and x < ARENA_W - WALL - 24 and y > WALL + 24 and y < ARENA_H - WALL - 24 then
+			return x, y
+		end
+	end
+	for _ = 1, 10 do
+		local x, y = rnd(WALL + 40, ARENA_W - WALL - 40), rnd(WALL + 40, ARENA_H - WALL - 40)
+		local dx, dy = x - P.x, y - P.y
+		if dx * dx + dy * dy > rx * rx * 0.5 then return x, y end
+	end
+	return clamp(P.x + rx, WALL + 24, ARENA_W - WALL - 24), clamp(P.y, WALL + 24, ARENA_H - WALL - 24)
+end
+
+local function pickType(t)
+	local choices, total = {}, 0
+	local function add(id, w)
+		choices[#choices + 1] = { id, w }
+		total = total + w
+	end
+	add("drifter", max(4, 10 - t / 60))
+	if t >= 35 then add("swarmer", 3 + t / 90) end
+	if t >= 70 then add("bruiser", 1.2 + t / 150) end
+	if t >= 100 then add("dasher", 1.6 + t / 200) end
+	if t >= 140 then add("spitter", 1.4 + t / 220) end
+	if t >= 190 then add("splitter", 1.2 + t / 260) end
+	local r = rng:NextNumber() * total
+	for i = 1, #choices do
+		r = r - choices[i][2]
+		if r <= 0 then return choices[i][1] end
+	end
+	return "drifter"
+end
+
+local function aliveCount()
+	local n = 0
+	local list = Ent.enemies
+	for i = 1, #list do
+		if list[i].alive then n = n + 1 end
+	end
+	return n
+end
+
+local function spawnGroup()
+	local t = R.time
+	local id = pickType(t)
+	local x, y = spawnPoint()
+	local n = 1
+	if id == "swarmer" then
+		n = 3 + floor(t / 100)
+	elseif id == "drifter" and t > 60 then
+		n = 1 + rndi(0, floor(t / 150) + 1)
+	end
+	for _ = 1, n do spawnEnemy(id, x + rnd(-26, 26), y + rnd(-26, 26)) end
+end
+
+local function ringEvent(n)
+	if U.banner then U.banner("A swarm is closing in!", COL.orange) end
+	addTimer(1.4, function()
+		if R.state ~= "playing" then return end
+		local rx, ry = Cam.vw * 0.42, Cam.vh * 0.42
+		local off = rnd(0, TAU)
+		for i = 1, n do
+			local a = off + i * TAU / n
+			local x, y = P.x + cos(a) * rx, P.y + sin(a) * ry
+			spawnEnemy("drifter", x, y)
+			burst(x, y, 3, COL.coral, 80, 0.4, 4)
+		end
+	end)
+end
+
+local function spawnBoss(id)
+	local x, y = spawnPoint()
+	local e = spawnEnemy(id, x, y)
+	R.shake = 10
+	if U.banner then U.banner(BT[id].name .. " attacks!", COL.red) end
+	return e
+end
+
+directorTick = function(dt)
+	local t = R.time
+	local df = DIFFS[Save.diff]
+	-- ordinary spawns ease off while a boss is on the field, so boss fights stay readable
+	local bossOn = false
+	local list = Ent.enemies
+	for i = 1, #list do
+		if list[i].alive and list[i].isBoss then
+			bossOn = true
+			break
+		end
+	end
+	R.spawnAcc = R.spawnAcc + (0.62 + t * 0.0052) * df.spawn * dt * (bossOn and 0.5 or 1)
+	while R.spawnAcc >= 1 do
+		R.spawnAcc = R.spawnAcc - 1
+		if aliveCount() < R.maxAlive then spawnGroup() end
+	end
+	-- scheduled boss arrivals (a warning first, then the boss)
+	local sched = BOSS_SCHEDULE[R.bossIdx]
+	if sched and t >= sched.t - 3 then
+		R.bossIdx = R.bossIdx + 1
+		if U.banner then U.banner("Something huge is surfacing...", COL.red) end
+		R.shake = 6
+		addTimer(3, function()
+			if R.state == "playing" then spawnBoss(sched.id) end
+		end)
+	end
+	-- swarm events
+	if t >= R.nextRing then
+		if R.nextRing > 0 then ringEvent(min(30, 11 + floor(t / 25))) end
+		R.nextRing = (R.nextRing == 0) and 70 or (R.nextRing + (t < 450 and 95 or 70))
+	end
+end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Input state read by the simulation (written by the input handlers further down)
+----------------------------------------------------------------------------------------------------
+local In = { joyX = 0, joyY = 0, padX = 0, padY = 0, touch = nil, startX = 0, startY = 0, knobX = 0, knobY = 0 }
+local KC = Enum.KeyCode
+
+local function rebuildGrid()
+	gridReset()
+	local list = Ent.enemies
+	local mr = 12
+	for i = 1, #list do
+		local e = list[i]
+		if e.alive then
+			gridAdd(e)
+			if e.r > mr then mr = e.r end
+		end
+	end
+	R.maxR = mr
+end
+
+----------------------------------------------------------------------------------------------------
+-- Weapons
+----------------------------------------------------------------------------------------------------
+local function syncBlades(n)
+	local blades = Ent.blades
+	while #blades < n do
+		local o = Pool.get(Pools.blade)
+		o.root.Visible = true
+		blades[#blades + 1] = { o = o, x = P.x, y = P.y }
+	end
+	while #blades > n do
+		local b = table.remove(blades)
+		Pool.put(Pools.blade, b.o)
+	end
+end
+
+local updateWeapons
+do
+local function updateOrbit(dt, st)
+	if #Ent.blades ~= st.n then syncBlades(st.n) end
+	P.orbitA = P.orbitA + st.spd * dt
+	local blades = Ent.blades
+	local dmg = st.dmg * P.dmgMul
+	for i = 1, st.n do
+		local b = blades[i]
+		local a = P.orbitA + (i - 1) * TAU / st.n
+		b.x, b.y = P.x + cos(a) * st.rad, P.y + sin(a) * st.rad
+		local n = query(b.x, b.y, 14 + R.maxR)
+		for k = 1, n do
+			local e = qbuf[k]
+			if e.alive and e.orbCd <= 0 then
+				local dx, dy = e.x - b.x, e.y - b.y
+				local rr = e.r + 13
+				if dx * dx + dy * dy < rr * rr then
+					e.orbCd = 0.35
+					local d = sqrt(dx * dx + dy * dy) + 0.001
+					damageEnemy(e, dmg, dx / d * 130, dy / d * 130)
+				end
+			end
+		end
+	end
+end
+
+local function castNova(st)
+	local rad = st.rad
+	local n = query(P.x, P.y, rad + R.maxR)
+	local any = false
+	for i = 1, n do
+		local e = qbuf[i]
+		if e.alive then
+			local dx, dy = e.x - P.x, e.y - P.y
+			local rr = rad + e.r
+			if dx * dx + dy * dy < rr * rr then
+				any = true
+				break
+			end
+		end
+	end
+	if not any then return false end
+	ringFx(P.x, P.y, 16, rad, 0.42, COL.cyan, 5)
+	ringFx(P.x, P.y, 8, rad * 0.72, 0.34, COL.white, 3, 0.4)
+	local dmg = st.dmg * P.dmgMul
+	for i = 1, n do
+		local e = qbuf[i]
+		if e.alive then
+			local dx, dy = e.x - P.x, e.y - P.y
+			local d = sqrt(dx * dx + dy * dy) + 0.001
+			if d < rad + e.r then damageEnemy(e, dmg, dx / d * st.kb, dy / d * st.kb) end
+		end
+	end
+	R.shake = max(R.shake, 3)
+	return true
+end
+
+local function castArc(st)
+	local cur = nearestEnemy(P.x, P.y, st.reach)
+	if not cur then return false end
+	local hit = { [cur] = true }
+	local px, py = P.x, P.y
+	local dmg = st.dmg * P.dmgMul
+	for i = 1, st.n do
+		zapZig(px, py, cur.x, cur.y)
+		px, py = cur.x, cur.y
+		damageEnemy(cur, dmg, 0, 0)
+		if i == st.n then break end
+		local nxt = nearestEnemy(px, py, 170, hit)
+		if not nxt then break end
+		hit[nxt] = true
+		cur = nxt
+	end
+	return true
+end
+
+updateWeapons = function(dt)
+	local w = P.weapons
+	local b = w.bolt
+	if b then
+		b.t = b.t - dt
+		if b.t <= 0 then
+			local st = BOLT[b.lv]
+			local target = nearestEnemy(P.x, P.y, 470)
+			if target and b.volley % 2 == 1 then
+				-- every other volley goes for a boss if one is in range
+				local list, bd = Ent.enemies, 470 * 470
+				for i = 1, #list do
+					local e = list[i]
+					if e.alive and e.isBoss then
+						local dx, dy = e.x - P.x, e.y - P.y
+						local d2 = dx * dx + dy * dy
+						if d2 < bd then target, bd = e, d2 end
+					end
+				end
+			end
+			if target then
+				b.volley = b.volley + 1
+				b.t = st.cd * P.cdMul
+				local base = atan2(target.y - P.y, target.x - P.x)
+				for i = 1, st.n do
+					fireBolt(P.x, P.y, base + (i - (st.n + 1) / 2) * 0.15, st.dmg * P.dmgMul, st.pierce)
+				end
+			else
+				b.t = 0.08
+			end
+		end
+	end
+	if w.orbit then updateOrbit(dt, ORBIT[w.orbit.lv]) end
+	local nv = w.nova
+	if nv then
+		nv.t = nv.t - dt
+		if nv.t <= 0 then
+			local st = NOVA[nv.lv]
+			nv.t = castNova(st) and st.cd * P.cdMul or 0.15
+		end
+	end
+	local ar = w.arc
+	if ar then
+		ar.t = ar.t - dt
+		if ar.t <= 0 then
+			local st = ARC[ar.lv]
+			ar.t = castArc(st) and st.cd * P.cdMul or 0.12
+		end
+	end
+end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Creature behaviour
+----------------------------------------------------------------------------------------------------
+local updateEnemies
+do
+local function ringShots(e, n, spd, dmg, off)
+	for i = 1, n do
+		local a = off + i * TAU / n
+		fireEShot(e.x, e.y, cos(a), sin(a), spd, dmg)
+	end
+end
+
+local function bossPattern(e, pat, ux, uy, enr)
+	local dmg = e.def.dmg * 0.5 * DIFFS[Save.diff].dmg
+	if pat == "ring" then
+		ringShots(e, enr and 18 or 12, 170, dmg, rnd(0, TAU))
+	elseif pat == "ring2" then
+		local n, off = enr and 16 or 12, rnd(0, TAU)
+		ringShots(e, n, 165, dmg, off)
+		addTimer(0.4, function()
+			if e.alive and R.state == "playing" then ringShots(e, n, 165, dmg, off + pi / n) end
+		end)
+	elseif pat == "aimed" then
+		local n = enr and 5 or 3
+		local base = atan2(uy, ux)
+		for i = 1, n do
+			local a = base + (i - (n + 1) / 2) * 0.22
+			fireEShot(e.x, e.y, cos(a), sin(a), 235, dmg)
+		end
+	elseif pat == "summon" then
+		local n = enr and 8 or 5
+		for i = 1, n do
+			local a = i * TAU / n
+			spawnEnemy("swarmer", e.x + cos(a) * (e.r + 14), e.y + sin(a) * (e.r + 14))
+		end
+		ringFx(e.x, e.y, e.r, e.r * 2.4, 0.5, COL.violet, 4)
+	elseif pat == "charge" then
+		e.st, e.stT = "wind", 0.9
+		e.dx, e.dy = ux, uy
+	end
+end
+
+local function aiBoss(e, dt, ux, uy, d)
+	local frac = e.hp / e.maxHp
+	local enr = frac < 0.5
+	if enr and not e.enraged then
+		e.enraged = true
+		R.shake = max(R.shake, 8)
+		ringFx(e.x, e.y, e.r, e.r * 3, 0.6, COL.red, 5)
+		if e.o.extra and e.o.extra.iris then e.o.extra.iris.BackgroundColor3 = COL.red end
+	end
+	local spd = e.spd * (enr and 1.25 or 1)
+	if e.st == "move" then
+		local mvx, mvy
+		if d > e.r + 150 then
+			mvx, mvy = ux * spd, uy * spd
+		else
+			mvx, mvy = -uy * spd * 0.5 * e.sd, ux * spd * 0.5 * e.sd
+		end
+		e.cd = e.cd - dt
+		if e.cd <= 0 then
+			local pats = e.def.pats
+			local pat = pats[e.pi]
+			e.pi = e.pi % #pats + 1
+			bossPattern(e, pat, ux, uy, enr)
+			e.cd = e.def.cd * (enr and 0.72 or 1)
+		end
+		return mvx, mvy
+	elseif e.st == "wind" then
+		e.stT = e.stT - dt
+		if e.stT > 0.25 then e.dx, e.dy = ux, uy end
+		if e.stT <= 0 then
+			e.st, e.stT = "dash", 0.65
+		end
+		return 0, 0
+	else
+		e.stT = e.stT - dt
+		if e.stT <= 0 then e.st = "move" end
+		return e.dx * 360, e.dy * 360
+	end
+end
+
+local function aiDasher(e, dt, ux, uy, d)
+	if e.st == "chase" then
+		e.cd = e.cd - dt
+		if e.cd <= 0 and d < 270 then
+			e.st, e.stT = "wind", 0.6
+		end
+		return ux * e.spd, uy * e.spd
+	elseif e.st == "wind" then
+		e.stT = e.stT - dt
+		e.dx, e.dy = ux, uy
+		if e.stT <= 0 then e.st, e.stT = "dash", 0.42 end
+		return ux * e.spd * 0.15, uy * e.spd * 0.15
+	elseif e.st == "dash" then
+		e.stT = e.stT - dt
+		if e.stT <= 0 then e.st, e.stT = "rest", 0.5 end
+		return e.dx * 400, e.dy * 400
+	end
+	e.stT = e.stT - dt
+	if e.stT <= 0 then
+		e.st = "chase"
+		e.cd = rnd(1.2, 2.2)
+	end
+	return 0, 0
+end
+
+local function aiSpitter(e, dt, ux, uy, d)
+	local mvx, mvy
+	if d > 270 then
+		mvx, mvy = ux * e.spd, uy * e.spd
+	elseif d < 180 then
+		mvx, mvy = -ux * e.spd, -uy * e.spd
+	else
+		mvx, mvy = -uy * e.spd * 0.5 * e.sd, ux * e.spd * 0.5 * e.sd
+	end
+	e.cd = e.cd - dt
+	if e.cd <= 0 and d < 430 then
+		e.cd = 2.6
+		fireEShot(e.x, e.y, ux, uy, 175, e.dmg)
+	end
+	return mvx, mvy
+end
+
+updateEnemies = function(dt)
+	local list = Ent.enemies
+	local px, py = P.x, P.y
+	local kd = exp(-7 * dt)
+	local maxR = R.maxR
+	for i = 1, #list do
+		local e = list[i]
+		if e.alive then
+			local dx, dy = px - e.x, py - e.y
+			local d = sqrt(dx * dx + dy * dy)
+			local ux, uy = 0, 0
+			if d > 0.001 then ux, uy = dx / d, dy / d end
+			local mvx, mvy
+			local ai = e.def.ai
+			if ai == "chase" then
+				mvx, mvy = ux * e.spd, uy * e.spd
+			elseif ai == "dasher" then
+				mvx, mvy = aiDasher(e, dt, ux, uy, d)
+			elseif ai == "spitter" then
+				mvx, mvy = aiSpitter(e, dt, ux, uy, d)
+			else
+				mvx, mvy = aiBoss(e, dt, ux, uy, d)
+			end
+			-- soft separation so swarms spread out instead of stacking
+			local sx, sy = 0, 0
+			if not e.isBoss then
+				local n = query(e.x, e.y, e.r + maxR)
+				for k = 1, n do
+					local o = qbuf[k]
+					if o ~= e and o.alive then
+						local ox, oy = e.x - o.x, e.y - o.y
+						local dd = ox * ox + oy * oy
+						local md = e.r + o.r
+						if dd < md * md and dd > 0.0001 then
+							local dist = sqrt(dd)
+							local f = (md - dist) / md * (o.mass / (o.mass + e.mass)) * 2
+							sx = sx + ox / dist * f
+							sy = sy + oy / dist * f
+						end
+					end
+				end
+			end
+			e.x = e.x + (mvx + sx * 70 + e.kx) * dt
+			e.y = e.y + (mvy + sy * 70 + e.ky) * dt
+			e.kx, e.ky = e.kx * kd, e.ky * kd
+			local lo, hiX, hiY = WALL + e.r, ARENA_W - WALL - e.r, ARENA_H - WALL - e.r
+			if e.x < lo then e.x = lo elseif e.x > hiX then e.x = hiX end
+			if e.y < lo then e.y = lo elseif e.y > hiY then e.y = hiY end
+			if d < P.r + e.r then
+				hurtPlayer(e.dmg)
+				if not e.isBoss then
+					e.kx = e.kx - ux * 140
+					e.ky = e.ky - uy * 140
+				end
+			end
+			if e.flash > 0 then e.flash = e.flash - dt end
+			if e.orbCd > 0 then e.orbCd = e.orbCd - dt end
+		end
+	end
+end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Shots, motes, pickups, player
+----------------------------------------------------------------------------------------------------
+local updatePlayer
+do
+local function readMove()
+	local x, y = 0, 0
+	local uis = UserInputService
+	if uis:IsKeyDown(KC.W) or uis:IsKeyDown(KC.Up) then y = y - 1 end
+	if uis:IsKeyDown(KC.S) or uis:IsKeyDown(KC.Down) then y = y + 1 end
+	if uis:IsKeyDown(KC.A) or uis:IsKeyDown(KC.Left) then x = x - 1 end
+	if uis:IsKeyDown(KC.D) or uis:IsKeyDown(KC.Right) then x = x + 1 end
+	x = x + In.joyX + In.padX
+	y = y + In.joyY + In.padY
+	local m = sqrt(x * x + y * y)
+	if m > 1 then x, y = x / m, y / m end
+	return x, y
+end
+
+updatePlayer = function(dt)
+	local mx, my = readMove()
+	local moving = mx ~= 0 or my ~= 0
+	if moving then
+		local l = sqrt(mx * mx + my * my)
+		P.fx, P.fy = mx / l, my / l
+	end
+	R.dashBuf = max(0, R.dashBuf - dt)
+	P.dashCd = max(0, P.dashCd - dt)
+	if R.dashBuf > 0 and P.dashCd <= 0 and P.dashT <= 0 then
+		R.dashBuf = 0
+		P.dashT, P.dashCd = 0.17, 2.2
+		P.dashDX, P.dashDY = P.fx, P.fy
+		P.iframes = max(P.iframes, 0.3)
+		sfx("dash", 0.3)
+		burst(P.x, P.y, 6, COL.gold, 120, 0.3, 4)
+	end
+	if P.dashT > 0 then
+		P.dashT = P.dashT - dt
+		P.vx, P.vy = P.dashDX * 620, P.dashDY * 620
+		emit(P.x, P.y, 0, 0, 14, COL.gold, 0.22, 0.55)
+	else
+		local k = 1 - exp(-16 * dt)
+		P.vx = P.vx + (mx * P.speed - P.vx) * k
+		P.vy = P.vy + (my * P.speed - P.vy) * k
+		if moving and chance(0.3) then
+			emit(P.x - P.vx * 0.05, P.y - P.vy * 0.05, rnd(-14, 14), rnd(-14, 14), 4, COL.gold, 0.35, 0.5)
+		end
+	end
+	P.x = clamp(P.x + P.vx * dt, WALL + P.r, ARENA_W - WALL - P.r)
+	P.y = clamp(P.y + P.vy * dt, WALL + P.r, ARENA_H - WALL - P.r)
+	if P.iframes > 0 then P.iframes = P.iframes - dt end
+	if P.regen > 0 and P.hp < P.maxHp then P.hp = min(P.maxHp, P.hp + P.regen * dt) end
+end
+end
+
+local simStep
+do
+local function updatePShots(dt)
+	local list = Ent.pshots
+	local qr = 5 + R.maxR
+	for i = 1, #list do
+		local s = list[i]
+		if s.alive then
+			s.x = s.x + s.vx * dt
+			s.y = s.y + s.vy * dt
+			s.life = s.life - dt
+			local dead = s.life <= 0 or s.x < WALL or s.x > ARENA_W - WALL or s.y < WALL or s.y > ARENA_H - WALL
+			if not dead then
+				local n = query(s.x, s.y, qr)
+				for k = 1, n do
+					local e = qbuf[k]
+					if e.alive and not (s.hit and s.hit[e]) then
+						local dx, dy = e.x - s.x, e.y - s.y
+						local rr = e.r + s.r
+						if dx * dx + dy * dy < rr * rr then
+							damageEnemy(e, s.dmg, s.vx * 0.16, s.vy * 0.16)
+							if s.pierce > 0 then
+								s.pierce = s.pierce - 1
+								s.hit[e] = true
+							else
+								dead = true
+								break
+							end
+						end
+					end
+				end
+			end
+			if dead then
+				s.alive = false
+				Pool.put(Pools.bolt, s.o)
+			end
+		end
+	end
+	compact(list)
+end
+
+local function updateEShots(dt)
+	local list = Ent.eshots
+	for i = 1, #list do
+		local s = list[i]
+		if s.alive then
+			s.x = s.x + s.vx * dt
+			s.y = s.y + s.vy * dt
+			s.life = s.life - dt
+			local dead = s.life <= 0 or s.x < WALL or s.x > ARENA_W - WALL or s.y < WALL or s.y > ARENA_H - WALL
+			if not dead then
+				local dx, dy = P.x - s.x, P.y - s.y
+				local rr = P.r + s.r - 2
+				if dx * dx + dy * dy < rr * rr and P.iframes <= 0 and P.dashT <= 0 then
+					hurtPlayer(s.dmg)
+					dead = true
+				end
+			end
+			if dead then
+				s.alive = false
+				Pool.put(Pools.ebolt, s.o)
+			end
+		end
+	end
+	compact(list)
+end
+
+local function updateGems(dt)
+	local list = Ent.gems
+	local pr2 = P.pickup * P.pickup
+	local vac = R.vacT > 0
+	local damp = exp(-6 * dt)
+	for i = 1, #list do
+		local g = list[i]
+		if g.alive then
+			local dx, dy = P.x - g.x, P.y - g.y
+			local d2 = dx * dx + dy * dy
+			if g.mag == 0 and (d2 < pr2 or vac) then
+				g.mag = 1
+				g.sp = 140
+			end
+			if g.mag == 1 then
+				g.sp = min(g.sp + 1100 * dt, 760)
+				local d = sqrt(d2) + 0.001
+				g.x = g.x + dx / d * g.sp * dt
+				g.y = g.y + dy / d * g.sp * dt
+				if d < P.r + 8 then collectGem(g) end
+			else
+				g.x = g.x + g.vx * dt
+				g.y = g.y + g.vy * dt
+				g.vx, g.vy = g.vx * damp, g.vy * damp
+			end
+		end
+	end
+	compact(list)
+end
+
+local function updatePickups(dt)
+	local list = Ent.picks
+	for i = 1, #list do
+		local k = list[i]
+		if k.alive then
+			k.life = k.life - dt
+			local dx, dy = P.x - k.x, P.y - k.y
+			local d2 = dx * dx + dy * dy
+			local rr = P.r + 16
+			if d2 < rr * rr then
+				k.alive = false
+				Pool.put(Pools.pick[k.kind], k.o)
+				if k.kind == "heal" then
+					local amt = P.maxHp * 0.25
+					P.hp = min(P.maxHp, P.hp + amt)
+					floatText(P.x, P.y - 26, "+" .. floor(amt + 0.5), COL.coral, 18)
+					burst(P.x, P.y, 8, COL.coral, 120, 0.6, 4)
+				else
+					R.vacT = 1.6
+					ringFx(P.x, P.y, 10, 260, 0.5, COL.cyan, 4)
+				end
+				sfx("ping", 0.25)
+			elseif k.life <= 0 then
+				k.alive = false
+				Pool.put(Pools.pick[k.kind], k.o)
+			end
+		end
+	end
+	compact(list)
+end
+
+-- One fixed 1/60 s step of the whole simulation.
+simStep = function(dt)
+	if R.state ~= "playing" and R.state ~= "dying" then return end
+	if R.state == "dying" then
+		R.dyingT = R.dyingT + dt
+		runTimers(dt)
+		if R.dyingT >= 0.5 then Game.finish(false) end
+		return
+	end
+	R.time = R.time + dt
+	updatePlayer(dt)
+	rebuildGrid()
+	updateWeapons(dt)
+	updateEnemies(dt)
+	updatePShots(dt)
+	updateEShots(dt)
+	updateGems(dt)
+	updatePickups(dt)
+	directorTick(dt)
+	runTimers(dt)
+	compact(Ent.enemies)
+	if R.vacT > 0 then R.vacT = R.vacT - dt end
+	if R.pending > 0 and R.state == "playing" then Game.openLevelUp() end
+end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Rendering the world (once per frame)
+----------------------------------------------------------------------------------------------------
+local function updateCamera(dt, snap)
+	local k = snap and 1 or (1 - exp(-7 * dt))
+	Cam.x = Cam.x + (P.x + P.vx * 0.22 - Cam.x) * k
+	Cam.y = Cam.y + (P.y + P.vy * 0.22 - Cam.y) * k
+	local hw, hh = Cam.vw * 0.5, Cam.vh * 0.5
+	if Cam.vw >= ARENA_W then Cam.x = ARENA_W * 0.5 else Cam.x = clamp(Cam.x, hw, ARENA_W - hw) end
+	if Cam.vh >= ARENA_H then Cam.y = ARENA_H * 0.5 else Cam.y = clamp(Cam.y, hh, ARENA_H - hh) end
+	local sx, sy = 0, 0
+	if R.shake > 0.25 then
+		if Save.shake then sx, sy = rnd(-1, 1) * R.shake, rnd(-1, 1) * R.shake end
+		R.shake = R.shake * exp(-9 * dt)
+	else
+		R.shake = 0
+	end
+	local ox, oy = Cam.x - hw + sx, Cam.y - hh + sy
+	local pos = U2(-ox / Cam.pw, 0, -oy / Cam.ph, 0)
+	world.Position = pos
+	back.Position = pos
+	far.Position = U2(-(ox * 0.25 + sin(R.time * 0.2) * 14) / Cam.pw, 0, -(oy * 0.25 + cos(R.time * 0.17) * 9) / Cam.ph, 0)
+end
+
+local function renderWorld(dt, fdt)
+	updateCamera(dt, false)
+	local t = R.time
+
+	-- player
+	Vis.root.Position = U2(P.x * INV_W, 0, P.y * INV_H, 0)
+	local ex, ey = floor(P.fx * 2 + 0.5), floor(P.fy * 2 + 0.5)
+	if ex ~= Vis.ex or ey ~= Vis.ey then
+		Vis.ex, Vis.ey = ex, ey
+		Vis.eyeL.Position = U2(0.5, -4 + ex, 0.5, -2 + ey)
+		Vis.eyeR.Position = U2(0.5, 4 + ex, 0.5, -2 + ey)
+	end
+	Vis.aura.BackgroundTransparency = 0.935 + 0.02 * sin(t * 3)
+	local shown = not (P.iframes > 0 and P.dashT <= 0) or floor(t * 22) % 2 == 0
+	if shown ~= Vis.shown then
+		Vis.shown = shown
+		Vis.body.BackgroundTransparency = shown and 0 or 0.65
+		Vis.core.BackgroundTransparency = shown and 0.1 or 0.7
+	end
+
+	-- creatures
+	local list = Ent.enemies
+	for i = 1, #list do
+		local e = list[i]
+		if e.alive then
+			e.o.root.Position = U2(e.x * INV_W, 0, e.y * INV_H, 0)
+			local want = e.def.col
+			if e.flash > 0 or (e.st == "wind" and floor(t * 16) % 2 == 0) then want = COL.white end
+			if e.curCol ~= want then
+				e.curCol = want
+				e.o.body.BackgroundColor3 = want
+			end
+			local ex2 = e.o.extra
+			if ex2 and ex2.pupil then
+				local dx, dy = P.x - e.x, P.y - e.y
+				local d = sqrt(dx * dx + dy * dy) + 0.001
+				local ox, oy = floor(dx / d * 14 + 0.5), floor(dy / d * 14 + 0.5)
+				if ox ~= e.pupX or oy ~= e.pupY then
+					e.pupX, e.pupY = ox, oy
+					ex2.iris.Position = U2(0.5, floor(ox * 0.55), 0.5, floor(oy * 0.55))
+					ex2.pupil.Position = U2(0.5, floor(ox * 0.45), 0.5, floor(oy * 0.45))
+				end
+			end
+		end
+	end
+
+	-- shots, orbiting spores, motes, pickups
+	local ps = Ent.pshots
+	for i = 1, #ps do
+		local s = ps[i]
+		s.o.root.Position = U2(s.x * INV_W, 0, s.y * INV_H, 0)
+	end
+	local es = Ent.eshots
+	for i = 1, #es do
+		local s = es[i]
+		s.o.root.Position = U2(s.x * INV_W, 0, s.y * INV_H, 0)
+	end
+	local bl = Ent.blades
+	for i = 1, #bl do
+		local b = bl[i]
+		b.o.root.Position = U2(b.x * INV_W, 0, b.y * INV_H, 0)
+	end
+	local gs = Ent.gems
+	for i = 1, #gs do
+		local g = gs[i]
+		g.o.root.Position = U2(g.x * INV_W, 0, g.y * INV_H, 0)
+	end
+	local pk = Ent.picks
+	for i = 1, #pk do
+		local k = pk[i]
+		k.o.root.Position = U2(k.x * INV_W, 0, k.y * INV_H, 0)
+		k.o.root.Visible = k.life > 4 or floor(k.life * 6) % 2 == 0
+	end
+
+	-- particles
+	local parts = Ent.parts
+	local n = 0
+	local drag = 1 - exp(-3.2 * fdt)
+	for i = 1, #parts do
+		local p = parts[i]
+		p.life = p.life - fdt
+		if p.life <= 0 then
+			Pool.put(Pools.part, p.o)
+		else
+			p.vx = p.vx - p.vx * drag
+			p.vy = p.vy - p.vy * drag
+			p.x = p.x + p.vx * fdt
+			p.y = p.y + p.vy * fdt
+			local f = p.o.root
+			f.Position = U2(p.x * INV_W, 0, p.y * INV_H, 0)
+			f.BackgroundTransparency = p.tr0 + (1 - p.tr0) * (1 - p.life / p.max)
+			n = n + 1
+			parts[n] = p
+		end
+	end
+	for i = #parts, n + 1, -1 do parts[i] = nil end
+
+	-- floating numbers
+	local texts = Ent.texts
+	n = 0
+	for i = 1, #texts do
+		local tx = texts[i]
+		tx.life = tx.life - fdt
+		if tx.life <= 0 then
+			Pool.put(Pools.text, tx.o)
+		else
+			tx.y = tx.y + tx.vy * fdt
+			tx.vy = tx.vy * (1 - 2.2 * fdt)
+			local f = tx.o.root
+			f.Position = U2(tx.x * INV_W, 0, tx.y * INV_H, 0)
+			local a = clamp((1 - tx.life / tx.max - 0.45) / 0.55, 0, 1)
+			f.TextTransparency = a
+			f.TextStrokeTransparency = 0.45 + 0.55 * a
+			n = n + 1
+			texts[n] = tx
+		end
+	end
+	for i = #texts, n + 1, -1 do texts[i] = nil end
+
+	-- rings
+	local rings = Ent.rings
+	n = 0
+	for i = 1, #rings do
+		local r = rings[i]
+		r.life = r.life - fdt
+		if r.life <= 0 then
+			Pool.put(Pools.ring, r.o)
+		else
+			local k = 1 - r.life / r.max
+			local e = 1 - (1 - k) * (1 - k)
+			local rad = lerp(r.r0, r.r1, e)
+			local sz = max(4, floor(rad * 2))
+			r.o.root.Size = UDim2.fromOffset(sz, sz)
+			r.o.stroke.Transparency = r.tr0 + (1 - r.tr0) * k
+			n = n + 1
+			rings[n] = r
+		end
+	end
+	for i = #rings, n + 1, -1 do rings[i] = nil end
+
+	-- lightning
+	local zaps = Ent.zaps
+	n = 0
+	for i = 1, #zaps do
+		local z = zaps[i]
+		z.life = z.life - fdt
+		if z.life <= 0 then
+			Pool.put(Pools.zap, z.o)
+		else
+			z.o.root.BackgroundTransparency = 1 - z.life / z.max
+			n = n + 1
+			zaps[n] = z
+		end
+	end
+	for i = #zaps, n + 1, -1 do zaps[i] = nil end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Interface helpers
+----------------------------------------------------------------------------------------------------
+local function tween(inst, t, props, style)
+	local tw = TweenService:Create(inst, TweenInfo.new(t, style or Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props)
+	tw:Play()
+	return tw
+end
+
+-- Fires immediately on touch-down / click-down (used for in-game buttons where latency matters).
+local function press(obj, fn)
+	obj.InputBegan:Connect(function(input)
+		local ut = input.UserInputType
+		if ut == Enum.UserInputType.MouseButton1 or ut == Enum.UserInputType.Touch then fn(input) end
+	end)
+end
+
+local function makeButton(parent, text, w, h, pos, o)
+	o = o or {}
+	local base = o.col or COL.gold
+	local hov = base:Lerp(COL.white, 0.2)
+	local b = mk("TextButton", {
+		Name = "Btn_" .. text, AutoButtonColor = false, Text = text, TextSize = o.size or 20, Font = o.font or FONT_TITLE,
+		TextColor3 = o.textCol or COL.ink, BackgroundColor3 = base, BorderSizePixel = 0,
+		AnchorPoint = o.anchor or V2(0.5, 0.5), Position = pos, Size = UDim2.fromOffset(w, h),
+	}, parent)
+	corner(b, o.radius or 12)
+	local sc = mk("UIScale", { Scale = 1 }, b)
+	b.MouseEnter:Connect(function()
+		tween(b, 0.1, { BackgroundColor3 = hov })
+		tween(sc, 0.1, { Scale = 1.04 })
+	end)
+	b.MouseLeave:Connect(function()
+		tween(b, 0.12, { BackgroundColor3 = base })
+		tween(sc, 0.12, { Scale = 1 })
+	end)
+	b.Activated:Connect(function()
+		sc.Scale = 0.95
+		tween(sc, 0.14, { Scale = 1 })
+		sfx("click")
+		if o.onClick then o.onClick() end
+	end)
+	return b
+end
+
+local function newScreen(name, dim)
+	local s = mk("Frame", {
+		Name = name, Size = UDim2.fromScale(1, 1), BackgroundColor3 = COL.ink, BackgroundTransparency = dim or 1,
+		BorderSizePixel = 0, Active = true, Visible = false, ZIndex = 5,
+	}, ui)
+	U.screens[name] = s
+	return s
+end
+local function newPanel(parent, w, h)
+	local p = mk("Frame", {
+		Name = "Panel", AnchorPoint = V2(0.5, 0.5), Position = U2(0.5, 0, 0.5, 0), Size = UDim2.fromOffset(w, h),
+		BackgroundColor3 = COL.panel, BackgroundTransparency = 0.04, BorderSizePixel = 0,
+	}, parent)
+	corner(p, 18)
+	outline(p, COL.teal, 2, 0.3)
+	mk("UIScale", { Name = "PS", Scale = 1 }, p)
+	return p
+end
+
+----------------------------------------------------------------------------------------------------
+-- HUD (all HUD objects live in this block; the rest of the game talks to it through U)
+----------------------------------------------------------------------------------------------------
+do
+local hud = mk("Frame", {
+	Name = "HUD", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false, ZIndex = 2,
+}, ui)
+U.hud = hud
+local pad = mk("Frame", {
+	Name = "TouchPad", Size = U2(0.55, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0, Active = true,
+	ZIndex = 1, Visible = false,
+}, hud)
+local hurtFx = mk("Frame", {
+	Name = "HurtFx", Size = UDim2.fromScale(1, 1), BackgroundColor3 = COL.red, BackgroundTransparency = 1,
+	BorderSizePixel = 0, ZIndex = 2,
+}, hud)
+local hudMain = mk("Frame", {
+	Name = "HudMain", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 3,
+}, hud)
+
+local hudTL = mk("Frame", {
+	Name = "TopLeft", Position = U2(0, 14, 0, 8), Size = UDim2.fromOffset(240, 62), BackgroundTransparency = 1, BorderSizePixel = 0,
+}, hudMain)
+local hpBack = mk("Frame", {
+	Name = "HpBack", Size = UDim2.fromOffset(230, 22), BackgroundColor3 = COL.ink, BackgroundTransparency = 0.35, BorderSizePixel = 0,
+}, hudTL)
+pill(hpBack)
+outline(hpBack, COL.teal, 2, 0.5)
+local hpFill = mk("Frame", { Name = "HpFill", Size = U2(1, 0, 1, 0), BackgroundColor3 = COL.coral, BorderSizePixel = 0 }, hpBack)
+pill(hpFill)
+local hpText = label(hpBack, "100 / 100", 15, COL.white, FONT_BOLD, {
+	Size = U2(1, 0, 1, 0), ZIndex = 2, TextStrokeTransparency = 0.6, TextStrokeColor3 = COL.ink,
+})
+local xpBack = mk("Frame", {
+	Name = "XpBack", Position = UDim2.fromOffset(0, 28), Size = UDim2.fromOffset(230, 10), BackgroundColor3 = COL.ink,
+	BackgroundTransparency = 0.35, BorderSizePixel = 0,
+}, hudTL)
+pill(xpBack)
+local xpFill = mk("Frame", { Name = "XpFill", Size = U2(0, 0, 1, 0), BackgroundColor3 = COL.lime, BorderSizePixel = 0 }, xpBack)
+pill(xpFill)
+local lvText = label(hudTL, "Level 1", 15, COL.text, FONT_TITLE, {
+	Position = UDim2.fromOffset(2, 40), Size = UDim2.fromOffset(160, 20), TextXAlignment = Enum.TextXAlignment.Left,
+	TextStrokeTransparency = 0.6, TextStrokeColor3 = COL.ink,
+})
+
+local hudTC = mk("Frame", {
+	Name = "TopCenter", AnchorPoint = V2(0.5, 0), Position = U2(0.5, 0, 0, 8), Size = UDim2.fromOffset(320, 70),
+	BackgroundTransparency = 1, BorderSizePixel = 0,
+}, hudMain)
+local timeText = label(hudTC, "00:00", 28, COL.text, FONT_TITLE, {
+	Size = UDim2.fromOffset(320, 32), TextStrokeTransparency = 0.55, TextStrokeColor3 = COL.ink,
+})
+local bossBox = mk("Frame", {
+	Name = "BossBox", AnchorPoint = V2(0.5, 0), Position = U2(0.5, 0, 0, 34), Size = UDim2.fromOffset(300, 34),
+	BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false,
+}, hudTC)
+local bossName = label(bossBox, "", 15, COL.text, FONT_TITLE, {
+	Size = U2(1, 0, 0, 17), TextStrokeTransparency = 0.5, TextStrokeColor3 = COL.ink,
+})
+local bossBack = mk("Frame", {
+	Position = UDim2.fromOffset(0, 20), Size = U2(1, 0, 0, 12), BackgroundColor3 = COL.ink, BackgroundTransparency = 0.3,
+	BorderSizePixel = 0,
+}, bossBox)
+pill(bossBack)
+outline(bossBack, COL.red, 2, 0.5)
+local bossFill = mk("Frame", { Size = U2(1, 0, 1, 0), BackgroundColor3 = COL.red, BorderSizePixel = 0 }, bossBack)
+pill(bossFill)
+
+local hudTR = mk("Frame", {
+	Name = "TopRight", AnchorPoint = V2(1, 0), Position = U2(1, -14, 0, 8), Size = UDim2.fromOffset(150, 70),
+	BackgroundTransparency = 1, BorderSizePixel = 0,
+}, hudMain)
+local pauseBtn = mk("TextButton", {
+	Name = "PauseBtn", AnchorPoint = V2(1, 0), Position = U2(1, 0, 0, 0), Size = UDim2.fromOffset(40, 40),
+	BackgroundColor3 = COL.panel, BackgroundTransparency = 0.2, Text = "", AutoButtonColor = false, BorderSizePixel = 0,
+}, hudTR)
+pill(pauseBtn)
+outline(pauseBtn, COL.teal, 2, 0.35)
+bar(pauseBtn, 5, 16, COL.text, 0, -5, 0, 0, 2)
+bar(pauseBtn, 5, 16, COL.text, 0, 5, 0, 0, 2)
+local killsText = label(hudTR, "Kills 0", 16, COL.text, FONT_TITLE, {
+	AnchorPoint = V2(1, 0), Position = U2(1, 0, 0, 46), Size = UDim2.fromOffset(150, 20), TextXAlignment = Enum.TextXAlignment.Right,
+	TextStrokeTransparency = 0.55, TextStrokeColor3 = COL.ink,
+})
+
+local bannerLbl = label(hudMain, "", 30, COL.gold, FONT_TITLE, {
+	Name = "Banner", AnchorPoint = V2(0.5, 0.5), Position = U2(0.5, 0, 0.27, 0), Size = UDim2.fromOffset(640, 44),
+	TextTransparency = 1, TextStrokeTransparency = 1, TextStrokeColor3 = COL.ink,
+})
+local hintLbl = label(hudMain, "", 16, COL.text, FONT_BODY, {
+	Name = "Hint", AnchorPoint = V2(0.5, 1), Position = U2(0.5, 0, 1, -54), Size = UDim2.fromOffset(520, 20),
+	TextTransparency = 1, TextStrokeTransparency = 1, TextStrokeColor3 = COL.ink,
+})
+local buildRow = mk("Frame", {
+	Name = "BuildRow", AnchorPoint = V2(0.5, 1), Position = U2(0.5, 0, 1, -10), Size = UDim2.fromOffset(360, 34),
+	BackgroundTransparency = 1, BorderSizePixel = 0,
+}, hudMain)
+
+-- Touch controls: joystick (left) and dash button (right)
+local joy = mk("Frame", {
+	Name = "Joystick", AnchorPoint = V2(0, 1), Position = U2(0, 26, 1, -26), Size = UDim2.fromOffset(136, 136),
+	BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false,
+}, hudMain)
+local joyBase = circle(joy, 128, COL.white, 0.9)
+outline(joyBase, COL.white, 2, 0.65)
+local joyKnob = circle(joy, 58, COL.gold, 0.2)
+local dashBtn = mk("TextButton", {
+	Name = "DashBtn", AnchorPoint = V2(1, 1), Position = U2(1, -26, 1, -26), Size = UDim2.fromOffset(92, 92),
+	BackgroundColor3 = COL.panel, BackgroundTransparency = 0.15, Text = "Dash", TextSize = 22, Font = FONT_TITLE,
+	TextColor3 = COL.gold, AutoButtonColor = false, BorderSizePixel = 0,
+}, hudMain)
+pill(dashBtn)
+local dashStroke = outline(dashBtn, COL.gold, 3, 0.15)
+local dashSc = mk("UIScale", { Scale = 1 }, dashBtn)
+
+-- Pointer to a boss that is off screen
+local bossMark = mk("Frame", {
+	Name = "BossMark", AnchorPoint = V2(0.5, 0.5), Size = UDim2.fromOffset(22, 22), BackgroundColor3 = COL.red,
+	Rotation = 45, BorderSizePixel = 0, Visible = false,
+}, hudMain)
+corner(bossMark, 5)
+
+function U.applyInset()
+	local y = 8 + U.inset
+	hudTL.Position = UDim2.fromOffset(14, y)
+	hudTC.Position = U2(0.5, 0, 0, y)
+	hudTR.Position = U2(1, -14, 0, y)
+end
+
+function U.banner(text, col)
+	bannerLbl.Text = text
+	bannerLbl.TextColor3 = col or COL.gold
+	U.bannerT = 2.4
+end
+
+function U.setHint(text)
+	hintLbl.Text = text
+	U.hintT = 9
+end
+
+function U.refreshBuild()
+	for _, c in ipairs(buildRow:GetChildren()) do c:Destroy() end
+	local items = {}
+	for _, id in ipairs(WEAPON_IDS) do
+		if P.weapons[id] then items[#items + 1] = { id, P.weapons[id].lv } end
+	end
+	for _, id in ipairs(PASSIVE_IDS) do
+		if (P.passives[id] or 0) > 0 then items[#items + 1] = { id, P.passives[id] } end
+	end
+	local n = #items
+	for i, it in ipairs(items) do
+		local box = mk("Frame", {
+			AnchorPoint = V2(0.5, 0.5), Position = U2(0.5, floor((i - (n + 1) / 2) * 34), 0.5, 0), Size = UDim2.fromOffset(30, 30),
+			BackgroundColor3 = COL.ink, BackgroundTransparency = 0.3, BorderSizePixel = 0,
+		}, buildRow)
+		corner(box, 8)
+		icon(box, it[1], 22, { AnchorPoint = V2(0.5, 0.5), Position = U2(0.5, 0, 0.5, -1) })
+		label(box, tostring(it[2]), 12, COL.white, FONT_BOLD, {
+			AnchorPoint = V2(1, 1), Position = U2(1, -2, 1, 0), Size = UDim2.fromOffset(14, 12),
+			TextXAlignment = Enum.TextXAlignment.Right, TextStrokeTransparency = 0.5, TextStrokeColor3 = COL.ink,
+		})
+	end
+end
+
+-- Touch controls are shown when the last input was touch (or the device has no keyboard).
+function U.refreshControls()
+	local last = UserInputService:GetLastInputType()
+	local touchy = UserInputService.TouchEnabled and (last == Enum.UserInputType.Touch or not UserInputService.KeyboardEnabled)
+	U.touchUI = touchy
+	local playing = R.state == "playing"
+	dashSc.Scale = touchy and 1 or 0.72
+	joy.Visible = touchy and playing
+	pad.Visible = touchy and playing
+	dashBtn.Visible = playing or R.state == "dying"
+end
+
+local hc = {}   -- cached HUD values: only touch GUI properties when something actually changed
+local function setIf(key, value, apply)
+	if hc[key] ~= value then
+		hc[key] = value
+		apply(value)
+	end
+end
+
+function U.updateHud(dt)
+	if not hud.Visible then return end
+	local frac = floor(clamp(P.hp / P.maxHp, 0, 1) * 200)
+	setIf("hpf", frac, function(v) hpFill.Size = U2(v / 200, 0, 1, 0) end)
+	setIf("hpt", floor(P.hp + 0.5) * 100000 + floor(P.maxHp + 0.5), function()
+		hpText.Text = floor(P.hp + 0.5) .. " / " .. floor(P.maxHp + 0.5)
+	end)
+	setIf("hpc", P.hp < P.maxHp * 0.3, function(low) hpFill.BackgroundColor3 = low and COL.red or COL.coral end)
+	setIf("xpf", floor(clamp(R.xp / R.xpNeed, 0, 1) * 200), function(v) xpFill.Size = U2(v / 200, 0, 1, 0) end)
+	setIf("lv", R.level, function(v) lvText.Text = "Level " .. v end)
+	setIf("time", floor(R.time), function(v) timeText.Text = fmtTime(v) end)
+	setIf("kills", R.kills, function(v) killsText.Text = "Kills " .. v end)
+
+	-- dash cooldown
+	local cd = P.dashCd
+	setIf("dash", cd > 0 and floor(cd * 10) + 1 or 0, function(v)
+		if v == 0 then
+			dashBtn.Text = "Dash"
+			dashBtn.TextColor3 = COL.gold
+			dashStroke.Color = COL.gold
+		else
+			dashBtn.Text = string.format("%.1f", cd)
+			dashBtn.TextColor3 = COL.dim
+			dashStroke.Color = COL.dim
+		end
+	end)
+
+	-- boss bar and off-screen pointer
+	local boss
+	local list = Ent.enemies
+	for i = 1, #list do
+		local e = list[i]
+		if e.alive and e.isBoss then
+			boss = e
+			break
+		end
+	end
+	setIf("boss", boss ~= nil, function(on) bossBox.Visible = on end)
+	if boss then
+		setIf("bossn", boss.def.name, function(v) bossName.Text = v end)
+		bossFill.Size = U2(clamp(boss.hp / boss.maxHp, 0, 1), 0, 1, 0)
+		local dx, dy = (boss.x - Cam.x) / (Cam.vw * 0.5), (boss.y - Cam.y) / (Cam.vh * 0.5)
+		local m = max(abs(dx), abs(dy))
+		if m > 1.05 then
+			bossMark.Visible = true
+			bossMark.Position = U2(0.5 + dx / m * 0.46, 0, 0.5 + dy / m * 0.42, 0)
+		else
+			bossMark.Visible = false
+		end
+	elseif hc.markOn then
+		bossMark.Visible = false
+	end
+	hc.markOn = boss ~= nil
+
+	-- banner / hint fade, damage flash, low health pulse
+	if U.bannerT and U.bannerT > 0 then
+		U.bannerT = U.bannerT - dt
+		local a = clamp(U.bannerT / 0.6, 0, 1)
+		bannerLbl.TextTransparency = 1 - a
+		bannerLbl.TextStrokeTransparency = 1 - a * 0.5
+	end
+	if U.hintT and U.hintT > 0 then
+		U.hintT = U.hintT - dt
+		local a = clamp(U.hintT / 1.2, 0, 1)
+		hintLbl.TextTransparency = 1 - a
+		hintLbl.TextStrokeTransparency = 1 - a * 0.5
+	end
+	local flash = 1
+	if U.hurtT > 0 then
+		U.hurtT = U.hurtT - dt
+		flash = 1 - 0.38 * clamp(U.hurtT / 0.5, 0, 1)
+	end
+	if R.state == "playing" and P.hp < P.maxHp * 0.3 then
+		flash = min(flash, 0.9 - 0.06 * sin(R.time * 6))
+	end
+	if flash ~= hc.flash then
+		hc.flash = flash
+		hurtFx.BackgroundTransparency = flash
+	end
+
+	-- joystick knob
+	local kx, ky = floor(In.knobX), floor(In.knobY)
+	if kx ~= hc.kx or ky ~= hc.ky then
+		hc.kx, hc.ky = kx, ky
+		joyKnob.Position = U2(0.5, kx, 0.5, ky)
+	end
+end
+U.pad, U.dashBtn, U.pauseBtn = pad, dashBtn, pauseBtn
+end
+
+----------------------------------------------------------------------------------------------------
+-- Screens
+----------------------------------------------------------------------------------------------------
+function U.show(name)
+	for k, s in pairs(U.screens) do
+		local on = k == name
+		if on and not s.Visible then
+			local panel = s:FindFirstChild("Panel")
+			local ps = panel and panel:FindFirstChild("PS")
+			if ps then
+				ps.Scale = 0.93
+				tween(ps, 0.2, { Scale = 1 }, Enum.EasingStyle.Back)
+			end
+		end
+		s.Visible = on
+	end
+end
+
+-- ===== Title =====
+do
+	local title = newScreen("title", 1)
+	local bg = mk("Frame", {
+		Name = "Bg", Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Active = false,
+	}, title)
+	gradient(bg, C3(17, 84, 98), C3(3, 13, 21), 90)
+	for i = 1, 3 do
+		local f = mk("Frame", {
+			Name = "Shaft", AnchorPoint = V2(0.5, 0), Position = U2(0.2 + i * 0.22, 0, -0.1, 0),
+			Size = U2(0, 90 + i * 24, 1.4, 0), Rotation = 14, BackgroundColor3 = C3(190, 255, 245), BorderSizePixel = 0,
+		}, bg)
+		mk("UIGradient", { Transparency = NumberSequence.new(0.9, 1), Rotation = 90 }, f)
+	end
+	U.motes = {}
+	for i = 1, 30 do
+		local d = rndi(3, 13)
+		local f = mk("Frame", {
+			Name = "Mote", AnchorPoint = V2(0.5, 0.5), Position = U2(rnd(0, 1), 0, rnd(0, 1), 0), Size = UDim2.fromOffset(d, d),
+			BackgroundColor3 = (i % 3 == 0) and COL.gold or COL.text, BackgroundTransparency = rnd(0.45, 0.85), BorderSizePixel = 0,
+		}, bg)
+		pill(f)
+		U.motes[i] = { f = f, x = f.Position.X.Scale, y = f.Position.Y.Scale, vy = rnd(4, 16), sw = rnd(0, TAU) }
+	end
+	U.glow = {}
+	for i = 1, 6 do U.glow[i] = circle(title, 470 - i * 56, COL.gold, 0.972, 0, -118) end
+
+	label(title, "Lumen Deep", 84, C3(8, 46, 56), FONT_TITLE, {
+		AnchorPoint = V2(0.5, 0.5), Position = U2(0.5, 0, 0.5, -122), Size = UDim2.fromOffset(700, 100),
+	})
+	label(title, "Lumen Deep", 84, COL.gold, FONT_TITLE, {
+		Name = "TitleText", AnchorPoint = V2(0.5, 0.5), Position = U2(0.5, 0, 0.5, -128), Size = UDim2.fromOffset(700, 100),
+		TextStrokeTransparency = 0.5, TextStrokeColor3 = COL.teal,
+	})
+	label(title, "Light the dark. Outlast the swarm.", 19, COL.text, FONT_BODY, {
+		AnchorPoint = V2(0.5, 0.5), Position = U2(0.5, 0, 0.5, -70), Size = UDim2.fromOffset(500, 24),
+	})
+
+	makeButton(title, "Dive in", 264, 58, U2(0.5, 0, 0.5, -8), { col = COL.gold, size = 28, onClick = function() Game.start() end })
+	makeButton(title, "Upgrades", 174, 44, U2(0.5, -93, 0.5, 60), {
+		col = COL.teal, size = 20, onClick = function() U.refreshPerks(); U.show("perks") end })
+	makeButton(title, "How to play", 174, 44, U2(0.5, 93, 0.5, 60), {
+		col = COL.teal, size = 20, onClick = function() U.show("how") end })
+	U.diffBtn = makeButton(title, "", 174, 38, U2(0.5, -93, 0.5, 112), {
+		col = COL.panel2, textCol = COL.text, size = 17, font = FONT_BOLD,
+		onClick = function()
+			Save.diff = Save.diff % #DIFFS + 1
+			saveStore()
+			U.refreshTitle()
+		end })
+	U.soundBtn = makeButton(title, "", 174, 38, U2(0.5, 93, 0.5, 112), {
+		col = COL.panel2, textCol = COL.text, size = 17, font = FONT_BOLD,
+		onClick = function()
+			Save.sound = not Save.sound
+			saveStore()
+			U.refreshTitle()
+		end })
+	makeButton(title, "Quit game", 120, 30, U2(0.5, 0, 0.5, 160), {
+		col = COL.panel, textCol = COL.dim, size = 15, font = FONT_BOLD, radius = 9, onClick = function() Game.quit() end })
+	U.footer = label(title, "", 16, COL.dim, FONT_BOLD, {
+		AnchorPoint = V2(0.5, 0.5), Position = U2(0.5, 0, 0.5, 200), Size = UDim2.fromOffset(500, 22),
+	})
+end
+
+function U.refreshTitle()
+	U.diffBtn.Text = "Difficulty: " .. DIFFS[Save.diff].name
+	U.soundBtn.Text = "Sound: " .. (Save.sound and "On" or "Off")
+	U.footer.Text = "Best score " .. comma(Save.best) .. "     Pearls " .. comma(Save.pearls)
+end
+
+-- ===== How to play =====
+do
+	local how = newScreen("how", 0.35)
+	local p = newPanel(how, 620, 388)
+	label(p, "How to play", 34, COL.gold, FONT_TITLE, { Position = UDim2.fromOffset(0, 16), Size = U2(1, 0, 0, 40) })
+	local lines = {
+		"Steer your light with WASD or the arrow keys, or drag on the left half of the screen. Your weapons fire on their own.",
+		"Glowing motes are experience. Collect them to level up, then pick one upgrade. Every pick changes your build.",
+		"Dash with Space or the Dash button to slip past danger. You cannot be hurt while dashing.",
+		"Bosses surface at 2:30, 5:00 and 7:30. Defeat The Watcher to win the dive, then keep going as long as you can.",
+		"Pearls from each dive buy permanent upgrades. They are kept for this Roblox session.",
+	}
+	for i, t in ipairs(lines) do
+		circle(p, 8, COL.teal, 0, -266, -194 + 80 - 4 + (i - 1) * 50 + 2)
+		label(p, t, 16, COL.text, FONT_BODY, {
+			Position = UDim2.fromOffset(56, 70 + (i - 1) * 50), Size = UDim2.fromOffset(536, 46), TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+		})
+	end
+	makeButton(p, "Back", 150, 44, U2(0.5, 0, 1, -32), { col = COL.gold, size = 20, onClick = function() U.show("title") end })
+end
+
+-- ===== Upgrades (pearl shop) =====
+do
+	local perks = newScreen("perks", 0.35)
+	local perkRows = {}
+	local p = newPanel(perks, 640, 410)
+	label(p, "Upgrades", 32, COL.gold, FONT_TITLE, { Position = UDim2.fromOffset(24, 8), Size = UDim2.fromOffset(300, 38), TextXAlignment = Enum.TextXAlignment.Left })
+	U.pearlLbl = label(p, "", 20, COL.text, FONT_TITLE, {
+		AnchorPoint = V2(1, 0), Position = U2(1, -24, 0, 14), Size = UDim2.fromOffset(260, 28), TextXAlignment = Enum.TextXAlignment.Right,
+	})
+	label(p, "Permanent boosts, kept for this Roblox session.", 14, COL.dim, FONT_BODY, {
+		Position = UDim2.fromOffset(26, 44), Size = UDim2.fromOffset(500, 18), TextXAlignment = Enum.TextXAlignment.Left,
+	})
+	for i, pk in ipairs(PERKS) do
+		local y = 68 + (i - 1) * 46
+		local row = mk("Frame", {
+			Name = "Row" .. i, Position = UDim2.fromOffset(20, y), Size = UDim2.fromOffset(600, 42), BackgroundColor3 = COL.panel2,
+			BackgroundTransparency = 0.35, BorderSizePixel = 0,
+		}, p)
+		corner(row, 12)
+		label(row, pk.name, 17, COL.text, FONT_TITLE, { Position = UDim2.fromOffset(14, 2), Size = UDim2.fromOffset(200, 20), TextXAlignment = Enum.TextXAlignment.Left })
+		label(row, pk.desc, 12, COL.dim, FONT_BODY, { Position = UDim2.fromOffset(14, 22), Size = UDim2.fromOffset(300, 16), TextXAlignment = Enum.TextXAlignment.Left })
+		local pips = {}
+		for k = 1, pk.max do
+			local pf = mk("Frame", {
+				AnchorPoint = V2(0, 0.5), Position = UDim2.fromOffset(330 + (k - 1) * 16, 21), Size = UDim2.fromOffset(11, 11),
+				BackgroundColor3 = COL.ink, BorderSizePixel = 0,
+			}, row)
+			pill(pf)
+			pips[k] = pf
+		end
+		local buy = mk("TextButton", {
+			Name = "Buy", AnchorPoint = V2(1, 0.5), Position = U2(1, -10, 0.5, 0), Size = UDim2.fromOffset(120, 30), Text = "", TextSize = 15,
+			Font = FONT_TITLE, AutoButtonColor = false, BackgroundColor3 = COL.gold, TextColor3 = COL.ink, BorderSizePixel = 0,
+		}, row)
+		corner(buy, 10)
+		buy.Activated:Connect(function()
+			local lvl = Save.perks[pk.id]
+			local cost = pk.base * (lvl + 1)
+			if lvl < pk.max and Save.pearls >= cost then
+				Save.pearls = Save.pearls - cost
+				Save.perks[pk.id] = lvl + 1
+				saveStore()
+				U.refreshPerks()
+				sfx("ping", 0.3)
+			else
+				sfx("click")
+			end
+		end)
+		perkRows[i] = { pips = pips, buy = buy }
+	end
+	makeButton(p, "Back", 150, 38, U2(0.5, 0, 1, -26), { col = COL.gold, size = 19, onClick = function() U.refreshTitle(); U.show("title") end })
+
+	function U.refreshPerks()
+		U.pearlLbl.Text = comma(Save.pearls) .. " pearls"
+		for i, pk in ipairs(PERKS) do
+			local lvl = Save.perks[pk.id]
+			local r = perkRows[i]
+			for k = 1, pk.max do
+				r.pips[k].BackgroundColor3 = (k <= lvl) and COL.gold or COL.ink
+			end
+			if lvl >= pk.max then
+				r.buy.Text = "Maxed"
+				r.buy.BackgroundColor3 = COL.panel
+				r.buy.TextColor3 = COL.dim
+			else
+				local cost = pk.base * (lvl + 1)
+				r.buy.Text = comma(cost) .. " pearls"
+				local ok = Save.pearls >= cost
+				r.buy.BackgroundColor3 = ok and COL.gold or COL.panel
+				r.buy.TextColor3 = ok and COL.ink or COL.dim
+			end
+		end
+	end
+end
+
+-- ===== Level up =====
+do
+	local lvlScreen = newScreen("levelup", 0.4)
+	local cards = {}
+	label(lvlScreen, "Level up!", 42, COL.gold, FONT_TITLE, {
+		AnchorPoint = V2(0.5, 0.5), Position = U2(0.5, 0, 0.5, -170), Size = UDim2.fromOffset(500, 50),
+		TextStrokeTransparency = 0.5, TextStrokeColor3 = COL.ink,
+	})
+	label(lvlScreen, "Pick one upgrade", 17, COL.text, FONT_BODY, {
+		AnchorPoint = V2(0.5, 0.5), Position = U2(0.5, 0, 0.5, -132), Size = UDim2.fromOffset(400, 22),
+	})
+	for i = 1, 3 do
+		local c = mk("TextButton", {
+			Name = "Card" .. i, AutoButtonColor = false, Text = "", BackgroundColor3 = COL.panel, BorderSizePixel = 0,
+			AnchorPoint = V2(0.5, 0.5), Position = U2(0.5, (i - 2) * 206, 0.5, 6), Size = UDim2.fromOffset(192, 240),
+		}, lvlScreen)
+		corner(c, 16)
+		local stroke = outline(c, COL.teal, 3, 0.15)
+		local sc = mk("UIScale", { Scale = 1 }, c)
+		local box = mk("Frame", {
+			Name = "IconBox", AnchorPoint = V2(0.5, 0), Position = U2(0.5, 0, 0, 16), Size = UDim2.fromOffset(62, 62),
+			BackgroundColor3 = COL.panel2, BorderSizePixel = 0,
+		}, c)
+		corner(box, 16)
+		local nameL = label(c, "", 21, COL.text, FONT_TITLE, { AnchorPoint = V2(0.5, 0), Position = U2(0.5, 0, 0, 88), Size = UDim2.fromOffset(180, 26) })
+		local lvlL = label(c, "", 15, COL.gold, FONT_BOLD, { AnchorPoint = V2(0.5, 0), Position = U2(0.5, 0, 0, 116), Size = UDim2.fromOffset(180, 18) })
+		local descL = label(c, "", 15, COL.dim, FONT_BODY, {
+			AnchorPoint = V2(0.5, 0), Position = U2(0.5, 0, 0, 142), Size = UDim2.fromOffset(166, 60), TextWrapped = true,
+			TextYAlignment = Enum.TextYAlignment.Top,
+		})
+		local keyBox = mk("Frame", {
+			AnchorPoint = V2(0.5, 1), Position = U2(0.5, 0, 1, -10), Size = UDim2.fromOffset(28, 24), BackgroundColor3 = COL.ink,
+			BackgroundTransparency = 0.2, BorderSizePixel = 0,
+		}, c)
+		corner(keyBox, 7)
+		label(keyBox, tostring(i), 15, COL.text, FONT_BOLD, { Size = U2(1, 0, 1, 0) })
+		c.MouseEnter:Connect(function() tween(sc, 0.1, { Scale = 1.05 }) end)
+		c.MouseLeave:Connect(function() tween(sc, 0.12, { Scale = 1 }) end)
+		c.Activated:Connect(function() Game.choose(i) end)
+		cards[i] = { btn = c, stroke = stroke, box = box, name = nameL, lvl = lvlL, desc = descL, icon = nil }
+	end
+	U.rerollBtn = makeButton(lvlScreen, "Reroll", 190, 40, U2(0.5, 0, 0.5, 168), {
+		col = COL.panel2, textCol = COL.text, size = 17, font = FONT_BOLD, onClick = function() Game.reroll() end })
+
+	function U.setChoices(choices)
+		R.choices = choices
+		for i = 1, 3 do
+			local c, ch = cards[i], choices[i]
+			local inf = INFO[ch.id]
+			if c.icon then c.icon:Destroy() end
+			c.icon = icon(c.box, ch.id, 46, { AnchorPoint = V2(0.5, 0.5), Position = U2(0.5, 0, 0.5, 0) })
+			c.name.Text = inf.name
+			c.stroke.Color = inf.col
+			if ch.kind == "weapon" then
+				c.lvl.Text = (ch.lv == 1) and "New weapon" or ("Weapon  -  level " .. ch.lv)
+				c.desc.Text = inf.desc[ch.lv]
+			elseif ch.kind == "passive" then
+				c.lvl.Text = (ch.lv == 1) and "New boost" or ("Boost  -  level " .. ch.lv)
+				c.desc.Text = inf.desc
+			else
+				c.lvl.Text = "One time"
+				c.desc.Text = inf.desc
+			end
+			c.lvl.TextColor3 = inf.col
+		end
+		U.rerollBtn.Text = "Reroll  (" .. R.rerolls .. " left)"
+	end
+end
+
+-- ===== Pause =====
+do
+	local pauseScreen = newScreen("pause", 0.45)
+	local p = newPanel(pauseScreen, 340, 360)
+	label(p, "Paused", 38, COL.gold, FONT_TITLE, { Position = UDim2.fromOffset(0, 18), Size = U2(1, 0, 0, 46) })
+	makeButton(p, "Resume", 240, 52, U2(0.5, 0, 0, 100), { col = COL.gold, size = 24, onClick = function() Game.resume() end })
+	makeButton(p, "Restart", 240, 44, U2(0.5, 0, 0, 160), { col = COL.teal, size = 20, onClick = function() Game.start() end })
+	makeButton(p, "Main menu", 240, 44, U2(0.5, 0, 0, 214), { col = COL.teal, size = 20, onClick = function() Game.toMenu() end })
+	U.pauseSound = makeButton(p, "", 116, 38, U2(0.5, -62, 0, 268), {
+		col = COL.panel2, textCol = COL.text, size = 16, font = FONT_BOLD,
+		onClick = function()
+			Save.sound = not Save.sound
+			saveStore()
+			U.refreshPause()
+		end })
+	U.pauseShake = makeButton(p, "", 116, 38, U2(0.5, 62, 0, 268), {
+		col = COL.panel2, textCol = COL.text, size = 16, font = FONT_BOLD,
+		onClick = function()
+			Save.shake = not Save.shake
+			saveStore()
+			U.refreshPause()
+		end })
+	label(p, "P  or  Start  to resume", 13, COL.dim, FONT_BODY, { AnchorPoint = V2(0.5, 1), Position = U2(0.5, 0, 1, -10), Size = UDim2.fromOffset(300, 16) })
+end
+function U.refreshPause()
+	U.pauseSound.Text = "Sound: " .. (Save.sound and "On" or "Off")
+	U.pauseShake.Text = "Shake: " .. (Save.shake and "On" or "Off")
+end
+
+-- ===== Results (defeat or victory) =====
+do
+	local overScreen = newScreen("over", 0.5)
+	local over = {}
+	U.over = over
+	local p = newPanel(overScreen, 520, 392)
+	over.title = label(p, "", 36, COL.gold, FONT_TITLE, { Position = UDim2.fromOffset(0, 18), Size = U2(1, 0, 0, 44) })
+	over.sub = label(p, "", 15, COL.dim, FONT_BODY, { Position = UDim2.fromOffset(0, 62), Size = U2(1, 0, 0, 20) })
+	local names = { "Time", "Level", "Kills", "Score" }
+	over.vals = {}
+	for i = 1, 4 do
+		local col, row = (i - 1) % 2, floor((i - 1) / 2)
+		local box = mk("Frame", {
+			Position = UDim2.fromOffset(40 + col * 226, 98 + row * 66), Size = UDim2.fromOffset(214, 58), BackgroundColor3 = COL.panel2,
+			BackgroundTransparency = 0.3, BorderSizePixel = 0,
+		}, p)
+		corner(box, 12)
+		label(box, names[i], 13, COL.dim, FONT_BOLD, { Position = UDim2.fromOffset(14, 6), Size = UDim2.fromOffset(180, 16), TextXAlignment = Enum.TextXAlignment.Left })
+		over.vals[i] = label(box, "", 26, COL.text, FONT_TITLE, { Position = UDim2.fromOffset(14, 22), Size = UDim2.fromOffset(190, 32), TextXAlignment = Enum.TextXAlignment.Left })
+	end
+	over.best = label(p, "", 16, COL.gold, FONT_BOLD, { Position = UDim2.fromOffset(0, 236), Size = U2(1, 0, 0, 22) })
+	over.pearls = label(p, "", 18, COL.text, FONT_TITLE, { Position = UDim2.fromOffset(0, 262), Size = U2(1, 0, 0, 24) })
+	over.again = makeButton(p, "Dive again", 150, 48, U2(0.5, -165, 1, -42), { col = COL.gold, size = 20, onClick = function() Game.start() end })
+	over.menu = makeButton(p, "Main menu", 150, 48, U2(0.5, 0, 1, -42), { col = COL.teal, size = 20, onClick = function() Game.toMenu() end })
+	over.keep = makeButton(p, "Keep diving", 150, 48, U2(0.5, 165, 1, -42), { col = COL.cyan, size = 20, onClick = function() Game.keepDiving() end })
+end
+
+----------------------------------------------------------------------------------------------------
+-- Game flow
+----------------------------------------------------------------------------------------------------
+local destroyed = false
+
+local function showWorld(on)
+	view.Visible = on
+	for i = 1, #vignette do vignette[i].Visible = on end
+end
+
+local function releaseJoy()
+	In.touch = nil
+	In.joyX, In.joyY, In.knobX, In.knobY = 0, 0, 0, 0
+end
+
+local function clearAll()
+	for _, e in ipairs(Ent.enemies) do if e.alive then Pool.put(Pools.enemy[e.id], e.o) end end
+	for _, s in ipairs(Ent.pshots) do if s.alive then Pool.put(Pools.bolt, s.o) end end
+	for _, s in ipairs(Ent.eshots) do if s.alive then Pool.put(Pools.ebolt, s.o) end end
+	for _, g in ipairs(Ent.gems) do if g.alive then Pool.put(Pools.gem[g.tier], g.o) end end
+	for _, k in ipairs(Ent.picks) do if k.alive then Pool.put(Pools.pick[k.kind], k.o) end end
+	for _, p in ipairs(Ent.parts) do Pool.put(Pools.part, p.o) end
+	for _, t in ipairs(Ent.texts) do Pool.put(Pools.text, t.o) end
+	for _, r in ipairs(Ent.rings) do Pool.put(Pools.ring, r.o) end
+	for _, z in ipairs(Ent.zaps) do Pool.put(Pools.zap, z.o) end
+	for _, b in ipairs(Ent.blades) do Pool.put(Pools.blade, b.o) end
+	for _, list in pairs(Ent) do wipe(list) end
+	gridReset()
+end
+
+function Game.reset()
+	clearAll()
+	R.time, R.kills, R.score = 0, 0, 0
+	R.level, R.xp, R.pending = 1, 0, 0
+	R.xpNeed = xpNeedFor(1)
+	R.rerolls = 2
+	R.spawnAcc, R.shake, R.vacT, R.dashBuf, R.acc = 0, 0, 0, 0, 0
+	R.won, R.endless, R.revived, R.purging, R.newBest = false, false, false, false, false
+	R.bossIdx, R.bossKills, R.nextRing = 1, 0, 0
+	R.dyingT, R.pearlsGiven, R.bonusPearls = 0, 0, 0
+	R.choices = nil
+	wipe(R.timers)
+	P.x, P.y, P.vx, P.vy = ARENA_W / 2, ARENA_H / 2, 0, 0
+	P.dashT, P.dashCd, P.iframes, P.orbitA = 0, 0, 1.2, 0
+	P.fx, P.fy = 1, 0
+	P.weapons = { bolt = { lv = 1, t = 0.3, volley = 0 } }
+	P.passives = { power = 0, tide = 0, fins = 0, shell = 0, lure = 0, bloom = 0 }
+	P.maxHp = nil
+	recompute()
+	P.hp = P.maxHp
+	releaseJoy()
+	U.hurtT = 0
+	Vis.shown = nil
+	U.refreshBuild()
+	Cam.x, Cam.y = P.x, P.y
+	updateCamera(0, true)
+end
+
+function Game.start()
+	Game.reset()
+	R.state = "playing"
+	U.show(nil)
+	U.hud.Visible = true
+	showWorld(true)
+	U.refreshControls()
+	U.setHint(U.touchUI and "Drag the left side to steer  -  tap Dash to dodge" or "WASD or arrows to move  -  Space to dash  -  P to pause")
+	U.bannerT = 0
+	sfx("click")
+end
+
+function Game.toMenu()
+	R.state = "menu"
+	releaseJoy()
+	clearAll()
+	U.hud.Visible = false
+	showWorld(false)
+	U.refreshTitle()
+	U.show("title")
+	U.refreshControls()
+end
+
+function Game.pause()
+	if R.state ~= "playing" then return end
+	R.state = "paused"
+	releaseJoy()
+	U.refreshPause()
+	U.show("pause")
+	U.refreshControls()
+end
+function Game.resume()
+	if R.state ~= "paused" then return end
+	R.state = "playing"
+	U.show(nil)
+	U.refreshControls()
+end
+function Game.togglePause()
+	if R.state == "playing" then Game.pause() elseif R.state == "paused" then Game.resume() end
+end
+
+do
+-- ===== Level-up choices =====
+local function buildChoices()
+	local pool = {}
+	local owned = 0
+	for _ in pairs(P.weapons) do owned = owned + 1 end
+	for _, id in ipairs(WEAPON_IDS) do
+		local w = P.weapons[id]
+		if w then
+			if w.lv < 5 then pool[#pool + 1] = { kind = "weapon", id = id, lv = w.lv + 1, w = 2.6 } end
+		elseif owned < 4 then
+			pool[#pool + 1] = { kind = "weapon", id = id, lv = 1, w = owned < 3 and 3.2 or 1.8 }
+		end
+	end
+	for _, id in ipairs(PASSIVE_IDS) do
+		local lv = P.passives[id]
+		if lv < 5 then pool[#pool + 1] = { kind = "passive", id = id, lv = lv + 1, w = 2 } end
+	end
+	local out = {}
+	for _ = 1, 3 do
+		if #pool == 0 then break end
+		local total = 0
+		for i = 1, #pool do total = total + pool[i].w end
+		local r = rng:NextNumber() * total
+		local idx = #pool
+		for i = 1, #pool do
+			r = r - pool[i].w
+			if r <= 0 then
+				idx = i
+				break
+			end
+		end
+		out[#out + 1] = table.remove(pool, idx)
+	end
+	local extras = { "heal", "pearl", "vac" }
+	local k = 1
+	while #out < 3 do
+		out[#out + 1] = { kind = "extra", id = extras[k], lv = 1 }
+		k = k + 1
+	end
+	return out
+end
+
+local function applyChoice(c)
+	if c.kind == "weapon" then
+		local w = P.weapons[c.id]
+		if w then w.lv = w.lv + 1 else P.weapons[c.id] = { lv = 1, t = 0.4, volley = 0 } end
+		if c.id == "orbit" then syncBlades(ORBIT[P.weapons.orbit.lv].n) end
+	elseif c.kind == "passive" then
+		P.passives[c.id] = P.passives[c.id] + 1
+		recompute()
+	elseif c.id == "heal" then
+		P.hp = min(P.maxHp, P.hp + P.maxHp * 0.4)
+	elseif c.id == "pearl" then
+		R.bonusPearls = R.bonusPearls + 40
+	elseif c.id == "vac" then
+		R.vacT = 2.5
+	end
+	U.refreshBuild()
+end
+
+function Game.openLevelUp()
+	if R.state ~= "playing" then return end
+	R.state = "levelup"
+	R.pending = R.pending - 1
+	releaseJoy()
+	U.setChoices(buildChoices())
+	U.hud.Visible = false
+	U.show("levelup")
+	U.refreshControls()
+	sfx("ping", 0.3)
+end
+
+function Game.choose(i)
+	if R.state ~= "levelup" or not R.choices then return end
+	local c = R.choices[i]
+	if not c then return end
+	applyChoice(c)
+	R.choices = nil
+	R.state = "playing"
+	P.iframes = max(P.iframes, 1)
+	U.hud.Visible = true
+	U.show(nil)
+	U.refreshControls()
+	ringFx(P.x, P.y, 12, 110, 0.45, INFO[c.id].col, 4)
+	burst(P.x, P.y, 12, INFO[c.id].col, 200, 0.6, 5)
+	sfx("click")
+end
+
+function Game.reroll()
+	if R.state ~= "levelup" or R.rerolls <= 0 then return end
+	R.rerolls = R.rerolls - 1
+	U.setChoices(buildChoices())
+	sfx("click")
+end
+
+-- ===== Bosses, results =====
+local function finalScore() return floor(R.score + R.time * 2 + R.level * 25) end
+
+local function awardPearls()
+	local df = DIFFS[Save.diff]
+	local total = floor((finalScore() / 30 + (R.won and 120 or 0) + R.bonusPearls) * df.pearl)
+	local give = max(0, total - R.pearlsGiven)
+	R.pearlsGiven = total
+	Save.pearls = Save.pearls + give
+	local fs = finalScore()
+	if fs > Save.best then
+		R.newBest = Save.best > 0
+		Save.best = fs
+	end
+	saveStore()
+	return give
+end
+
+function Game.bossDown(e)
+	R.bossKills = R.bossKills + 1
+	spawnPickup("heal", e.x, e.y)
+	if U.banner then U.banner(e.def.name .. " defeated!", COL.gold) end
+	if e.def.final and not R.won then
+		R.won = true
+		P.iframes = max(P.iframes, 6)
+		R.purging = true
+		local list = Ent.enemies
+		for i = 1, #list do
+			local o = list[i]
+			if o.alive and o ~= e then killEnemy(o) end
+		end
+		R.purging = false
+		addTimer(2.6, function()
+			if R.state == "playing" then Game.finish(true) end
+		end)
+		sfx("win")
+	end
+end
+
+function Game.finish(won)
+	if R.state == "over" then return end
+	local over = U.over
+	R.state = "over"
+	releaseJoy()
+	local give = awardPearls()
+	over.title.Text = won and "You outlasted the deep!" or (R.won and "Endless dive over" or "The light went out")
+	over.title.TextColor3 = won and COL.gold or (R.won and COL.cyan or COL.coral)
+	over.sub.Text = DIFFS[Save.diff].name .. " difficulty" .. (R.endless and "  -  endless" or "")
+	over.vals[1].Text = fmtTime(R.time)
+	over.vals[2].Text = tostring(R.level)
+	over.vals[3].Text = comma(R.kills)
+	over.vals[4].Text = comma(finalScore())
+	over.best.Text = R.newBest and "New best score!" or ("Best score " .. comma(Save.best))
+	over.pearls.Text = "+" .. comma(give) .. " pearls   (you have " .. comma(Save.pearls) .. ")"
+	over.keep.Visible = won
+	over.again.Position = won and U2(0.5, -165, 1, -42) or U2(0.5, -85, 1, -42)
+	over.menu.Position = won and U2(0.5, 0, 1, -42) or U2(0.5, 85, 1, -42)
+	U.hud.Visible = false
+	U.show("over")
+	U.refreshControls()
+	sfx(won and "win" or "lose")
+end
+
+function Game.keepDiving()
+	if R.state ~= "over" or not R.won then return end
+	R.state = "playing"
+	R.endless = true
+	P.iframes = 2
+	U.hud.Visible = true
+	U.show(nil)
+	U.refreshControls()
+	if U.banner then U.banner("Endless dive", COL.cyan) end
+end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Input: keyboard, touch joystick, gamepad, buttons
+----------------------------------------------------------------------------------------------------
+do
+local function wantDash()
+	if R.state == "playing" then R.dashBuf = 0.15 end
+end
+local function titleOrOverStart()
+	if R.state == "menu" and U.screens.title.Visible then
+		Game.start()
+	elseif R.state == "over" then
+		Game.start()
+	end
+end
+
+Janitor:add(UserInputService.InputBegan:Connect(function(input)
+	if UserInputService:GetFocusedTextBox() then return end
+	local ut, kc = input.UserInputType, input.KeyCode
+	if ut == Enum.UserInputType.Keyboard then
+		if kc == KC.Space or kc == KC.LeftShift or kc == KC.RightShift then
+			if R.state == "playing" then wantDash() else titleOrOverStart() end
+		elseif kc == KC.Return or kc == KC.KeypadEnter then
+			titleOrOverStart()
+		elseif kc == KC.P then
+			Game.togglePause()
+		elseif kc == KC.One then
+			Game.choose(1)
+		elseif kc == KC.Two then
+			Game.choose(2)
+		elseif kc == KC.Three then
+			Game.choose(3)
+		elseif kc == KC.R then
+			Game.reroll()
+		end
+	elseif ut == Enum.UserInputType.Gamepad1 then
+		if kc == KC.ButtonA then
+			if R.state == "playing" then wantDash() else titleOrOverStart() end
+		elseif kc == KC.ButtonStart then
+			Game.togglePause()
+		elseif kc == KC.ButtonX then
+			Game.choose(1)
+		elseif kc == KC.ButtonY then
+			Game.choose(2)
+		elseif kc == KC.ButtonB then
+			Game.choose(3)
+		end
+	end
+end))
+
+-- Floating joystick on the left half of the screen (touch). The stick follows a relative drag.
+local STICK_R = 46
+U.pad.InputBegan:Connect(function(input)
+	if input.UserInputType ~= Enum.UserInputType.Touch or In.touch or R.state ~= "playing" then return end
+	In.touch = input
+	In.startX, In.startY = input.Position.X, input.Position.Y
+	In.knobX, In.knobY = 0, 0
+	In.joyX, In.joyY = 0, 0
+end)
+Janitor:add(UserInputService.InputChanged:Connect(function(input)
+	if input == In.touch then
+		local s = U.scale
+		local dx, dy = input.Position.X - In.startX, input.Position.Y - In.startY
+		local m = sqrt(dx * dx + dy * dy)
+		local rpx = STICK_R * s
+		if m > rpx then
+			-- drag the origin along so the stick re-centres quickly when the thumb reverses
+			local over = (m - rpx) / m
+			In.startX = In.startX + dx * over
+			In.startY = In.startY + dy * over
+			dx, dy = dx * (1 - over), dy * (1 - over)
+			m = rpx
+		end
+		In.knobX, In.knobY = dx / s, dy / s
+		if m < 8 * s then
+			In.joyX, In.joyY = 0, 0
+		else
+			In.joyX, In.joyY = dx / rpx, dy / rpx
+		end
+	elseif input.KeyCode == KC.Thumbstick1 then
+		local p = input.Position
+		local x, y = p.X, -p.Y
+		local m = sqrt(x * x + y * y)
+		if m < 0.2 then
+			x, y = 0, 0
+		else
+			local k = min(1, (m - 0.2) / 0.8) / m
+			x, y = x * k, y * k
+		end
+		In.padX, In.padY = x, y
+	end
+end))
+Janitor:add(UserInputService.InputEnded:Connect(function(input)
+	if input == In.touch then releaseJoy() end
+end))
+
+press(U.dashBtn, function() wantDash() end)
+press(U.pauseBtn, function() Game.pause() end)
+
+Janitor:add(UserInputService.LastInputTypeChanged:Connect(function() U.refreshControls() end))
+Janitor:add(UserInputService.WindowFocusReleased:Connect(function() Game.pause() end))
+Janitor:add(GuiService.MenuOpened:Connect(function() Game.pause() end))
+
+-- Keep the 3D character from walking / jumping while you play: sink the game keys with a high priority action.
+pcall(function()
+	ContextActionService:BindActionAtPriority("LumenDeepInput", function() return Enum.ContextActionResult.Sink end, false,
+		Enum.ContextActionPriority.High.Value, KC.W, KC.A, KC.S, KC.D, KC.Up, KC.Down, KC.Left, KC.Right, KC.Space,
+		KC.LeftShift, KC.RightShift, KC.One, KC.Two, KC.Three)
+end)
+Janitor:add(function() ContextActionService:UnbindAction("LumenDeepInput") end)
+
+-- Hide Roblox's own HUD (restored when the game closes) and park the default touch controls.
+do
+	local saved = {}
+	local types = { Enum.CoreGuiType.PlayerList, Enum.CoreGuiType.Health, Enum.CoreGuiType.Backpack, Enum.CoreGuiType.Chat, Enum.CoreGuiType.EmotesMenu }
+	for _, t in ipairs(types) do
+		pcall(function()
+			saved[t] = StarterGui:GetCoreGuiEnabled(t)
+			StarterGui:SetCoreGuiEnabled(t, false)
+		end)
+	end
+	Janitor:add(function()
+		for t, v in pairs(saved) do
+			pcall(function() StarterGui:SetCoreGuiEnabled(t, v) end)
+		end
+	end)
+
+	local prevAuto
+	pcall(function()
+		prevAuto = GuiService.AutoSelectGuiEnabled
+		GuiService.AutoSelectGuiEnabled = false
+	end)
+	Janitor:add(function()
+		if prevAuto ~= nil then pcall(function() GuiService.AutoSelectGuiEnabled = prevAuto end) end
+	end)
+
+	local controls
+	task.spawn(function()
+		local ok, res = pcall(function()
+			local ps = player:WaitForChild("PlayerScripts", 5)
+			local pm = ps and ps:WaitForChild("PlayerModule", 5)
+			if pm then return require(pm):GetControls() end
+			return nil
+		end)
+		if ok and res and not destroyed then
+			controls = res
+			pcall(function() controls:Disable() end)
+		end
+	end)
+	Janitor:add(function()
+		if controls then pcall(function() controls:Enable() end) end
+	end)
+end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Main loop, error guard, cleanup and boot
+----------------------------------------------------------------------------------------------------
+local registry = {}
+local loopDead = false
+
+local function destroyAll()
+	if destroyed then return end
+	destroyed = true
+	R.state = "closed"
+	Janitor:clean()
+	if rawget(_G, REGISTRY_KEY) == registry then rawset(_G, REGISTRY_KEY, nil) end
+end
+registry.destroy = destroyAll
+Game.quit = destroyAll
+
+local function showFatal()
+	loopDead = true
+	releaseJoy()
+	pcall(function()
+		local s = newScreen("error", 0.3)
+		local p = newPanel(s, 460, 230)
+		label(p, "Something went wrong", 30, COL.red, FONT_TITLE, { Position = UDim2.fromOffset(0, 20), Size = U2(1, 0, 0, 38) })
+		label(p, "The game stopped to protect your session. Details were printed to the output window.", 16, COL.text, FONT_BODY, {
+			Position = UDim2.fromOffset(30, 72), Size = UDim2.fromOffset(400, 60), TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
+		})
+		makeButton(p, "Close", 160, 46, U2(0.5, 0, 1, -40), { col = COL.gold, size = 20, onClick = destroyAll })
+		U.hud.Visible = false
+		U.show("error")
+	end)
+end
+
+local errCount, qualityT, fpsAvg, quality = 0, 0, 60, 3
+local lastAbs, lastAbs2 = V2(0, 0), V2(0, 0)
+local QUALITY_PART = { 40, 80, 140 }
+local QUALITY_MAX = { 50, 65, 80 }
+
+local function adaptQuality(dt)
+	fpsAvg = fpsAvg + (1 / max(dt, 0.004) - fpsAvg) * min(1, dt * 1.2)
+	qualityT = qualityT + dt
+	if qualityT >= 3 then
+		qualityT = 0
+		if fpsAvg < 36 and quality > 1 then
+			quality = quality - 1
+		elseif fpsAvg > 56 and quality < 3 then
+			quality = quality + 1
+		end
+		R.partCap, R.maxAlive = QUALITY_PART[quality], QUALITY_MAX[quality]
+	end
+end
+
+local function frame(dt)
+	if destroyed or loopDead then return end
+	if not gui.Parent or not gui2.Parent then
+		destroyAll()
+		return
+	end
+	local a, a2 = root.AbsoluteSize, root2.AbsoluteSize
+	if a ~= lastAbs or a2 ~= lastAbs2 then
+		lastAbs, lastAbs2 = a, a2
+		relayout()
+	end
+	dt = min(dt, 0.1)
+	local st = R.state
+	if st == "playing" or st == "dying" then
+		adaptQuality(dt)
+		local scale = (st == "dying") and 0.3 or 1
+		R.acc = R.acc + dt * scale
+		local n = 0
+		while R.acc >= STEP and n < 4 do
+			simStep(STEP)
+			R.acc = R.acc - STEP
+			n = n + 1
+			if R.state ~= "playing" and R.state ~= "dying" then break end
+		end
+		if n >= 4 then R.acc = 0 end
+		renderWorld(dt, dt * scale)
+	end
+	U.updateHud(dt)
+	if st == "menu" or st == "closed" then
+		-- ambient motion behind the menus
+		local t = os.clock()
+		local gt = 0.972 + 0.008 * sin(t * 1.4)
+		for i = 1, #U.glow do U.glow[i].BackgroundTransparency = gt end
+		for i = 1, #U.motes do
+			local m = U.motes[i]
+			m.y = m.y - m.vy * dt / max(U.uh, 1)
+			if m.y < -0.05 then m.y = 1.05 end
+			m.f.Position = U2(m.x + sin(t * 0.4 + m.sw) * 0.004, 0, m.y, 0)
+		end
+	end
+end
+
+Janitor:add(RunService.RenderStepped:Connect(function(dt)
+	local ok, err = xpcall(frame, debug.traceback, dt)
+	if not ok then
+		errCount = errCount + 1
+		warn("[Lumen Deep] " .. tostring(err))
+		if errCount >= 5 then showFatal() end
+	end
+end))
+
+-- Boot
+relayout()
+R.acc = 0
+R.maxR = 12
+U.refreshTitle()
+U.refreshControls()
+U.show("title")
+rawset(_G, REGISTRY_KEY, registry)
+print("[Lumen Deep] ready - press Dive in")
